@@ -1,0 +1,1541 @@
+Аудит ТЗ, доработка архитектуры, план системного аналитика, карта БД и оптимизация стека для оркестратора оценки рисков
+В распределении ролей системный аналитик / PM (Александр) задаёт единые контракты и критерии приёмки для остальных четырёх участников. Чтобы Артём (ядро), Роман (эмуляторы и синтетика), Максим (UI) и Алёнка (Figma и презентация) работали параллельно без пе
+ределок на финальной интеграции, работу аналитика целесообразно выстроить в 7 шагов с контрольными точками синхронизации (Gates).
+Шаг 1. Зафиксировать доменную модель и матрицу конфликтов (День 1, утро)
+Описать в docs/01_analytics_and_ai.md контекст AS-IS:
+ логистическая сеть из 5 складов, 4 магистральных коридоров, 8 SKU и 6 перевозчиков, где авторегламент и 3 риск-аналитика параллельно запускают 4 расчёта (StockoutRisk, DelayRisk, SpoilageRisk, CarrierDefaultRisk) поверх 4 общих витрин.
+Утвердить итоговую 
+таблицу доступов READ/WRITE с обязательным указанием lock_scope (BY_DATE для WarehouseStocks, TransitTelemetry, WeatherAndTraffic; GLOBAL для SupplierSLA), флага allow_parallel_dates (False для StockoutRisk и CarrierDefaultRisk; True для DelayRisk и Spoila
+geRisk) и порядка захвата в старой системе (acquire_order).
+Точка передачи (Gate 1):
+ Согласовать матрицу с Артёмом и Романом, чтобы core/models.py и services/microservices.py опирались на идентичный реестр правил.
+Шаг 2. Сгенерировать логи «старой системы»
+ и провести ИИ-анализ узких мест (День 1, день)
+Запустить скрипт scripts/generate_legacy_logs.py (код приведён в следующем разделе) с seed=42, получив журнал из 86 событий (legacy_system_logs.log и legacy_system_logs.jsonl), из которых 21 событие (24,4% за
+писей; 21 аварийная задача из 38 запущенных, или 55,3%) — критические сбои всех 4 классов.
+Передать текстовый лог в LLM с приведённым ниже промптом и зафиксировать в docs/01_analytics_and_ai.md три артефакта: образец исходного лога, точный текст промпта и структурированный вывод ИИ.
+Сверить количественные итоги от ИИ с эталонной сводкой генерато
+ра (8 ошибок AB-BA deadlock, 6 ошибок staging-коллизий, 4 ошибки Lost Update, 3 ошибки грязного чтения глобального SLA), чтобы исключить ошибки подсчёта со стороны модели.
+Шаблон промпта для воспроизводимого ИИ-анализа узких мест (для docs/01_analytics_and_ai.md):
+Ты — ведущий системный аналитик и архитектор высоконагруженных систем. Проанализируй приложенный журнал событий (86 записей) системы оценки 
+логистических рисков.
+С
+формируй отчёт строго в 4 разделах:
+Количественная сводка: сгруппируй события уровня ERROR по кодам (ERR_DEADLOCK_ABBA, ERR_LOST_UPDATE, ERR_CROSS_DATE_STAGING, ERR_DIRTY_READ_GLOBAL), укажи точное число затронутых job_id и долю сбоев.
+Анализ первопричин (
+Root Cause Analysis): для каждого из 4 классов сбоев опиши точную механику столкновения (сервисы, витрины, типы триггеров AUTO/MANUAL, расчётные даты).
+Узкие места архитектуры AS-IS: выдели конкретные витрины и буферы, выступающие главными точками конкурен
+ции (hotspots).
+Архитектурные требования к оркестратору: предложи матрицу блокировок (SHARED/EXCLUSIVE, BY_DATE/GLOBAL), алгоритм предотвращения deadlock и политику приоритетов без изменения кода расчётных алгоритмов.
+Опирайся строго на факты из журнала, н
+е додумывай отсутствующие события.
+На диаграмме ниже объединён точный профиль инцидентов из сгенерированного журнала «старой системы» с контрольным графиком Ганта и метриками стресс-теста верифицированного оркестратора — этот ориентир аналитик использует п
+ри приёмке MVP.
+Шаг 3. Сформулировать проверяемые системные требования в docs/02_system_requirements.md (День 2, утро)
+Все требования должны быть привязаны к измеримым критериям приёмки и структурированы в виде двух реестров — функциональных (FR) и нефункц
+иональных (NFR) требований.
+Код
+Функциональное требование (FR)
+Проверяемый критерий приёмки
+FR-01
+Декларативный реестр процессов и ресурсных контрактов (READ/WRITE/READ_WRITE, BY_DATE/GLOBAL, allow_parallel_dates, staging_key, timeout_sec) в SQLite
+Изменение правила в processes/process_source_rules отражается в v_conflict_matrix и логике блокировок без переписывания сервисов
+FR-02
+Атомарная гранулярная оркестрация: проверка всех ключей задачи под единым asyncio.Lock с совместимостью SHARED + SHARED и блокировкой при EXCLUSIVE
+При занятости хотя бы одного ключа задача не удерживает остальные, остаётся в QUEUED и заполняет поле blocke
+d_by
+FR-03
+Приоритетное планирование (AUTO = 1, MANUAL = 2..3) с неблокирующим обходом очереди (
+work-conserving
+) и 
+Priority Aging
+Независимые задачи стартуют в обход заблокированной высокоприоритетной; ожидающая ручная задача повышает effective_priority с
+о временем
+FR-04
+Идемпотентность активных 
+заявок и ручная отмена из очереди
+Дубль (process_id, 
+target_date) при наличии активной задачи получает статус DEDUPLICATED; вызов cancel(task_id) переводит задачу из QUEUED в CANCELLED
+FR-05
+Многопользовательский контекст и полный аудит в БД
+Каждая задача хранит initiated_by и session_id; все события блокировок и переходы пишутся в task_runs, lock_audit и orchestrator_events
+FR-06
+Режим сравнения «Без оркестратора / С оркестратором» и контрол
+ь целостности витрин
+Переключатель orchestration_enabled воспроизводит ошибки при 0 и чистое выполнение при 1; итоги агрегируются в simulation_runs и v_before_after_comparison
+FR-07
+Живая визуализация порядка выполнения и управление регламентом
+UI в реаль
+ном времени обновляет 3 колонки задач, активные блокировки, журнал событий, интерактивный график Ганта и вкладку матрицы конфликтов
+Код
+Нефункциональное требование (NFR)
+Целевой показатель
+NFR-01
+Бесконфликтность при конкурентной нагрузке
+0 deadlock и 0 рантайм-конфликтов записи при стресс-прогоне пачек задач в режиме включённого оркестратора
+NFR-02
+Защита от зависших воркеров через TTL блокировок
+При превышении timeout_sec (по умолчанию 30 с) ключи освобождаются с записью EXPIRED_TTL в lock_audit и статусом FAILED (TimeoutError)
+NFR-03
+Отзывчивость интерфейса и отсутствие блокировки event loop
+Обновление карточек в браузере в реальном времени; оди
+ночная запись/чтение локальной SQLite WAL <2 мс (в локальном замере: 0,097–0,181 мс)
+NFR-04
+Стабильность многопользовательских веб-
+сессий
+Одновременная работа в нескольких вкладках 
+браузера без утечек памяти и с автоматической отпиской при client.on_delet
+e
+NFR-05
+Портативность и воспроизводимость стенда
+Запуск приложения одной командой (uv run main.py) на Python 3.11+ без Docker, Redis и внешней СУБД
+Шаг 4. Утвердить карту БД, пользовательские сценарии и макеты UI (День 2, день)
+Передать Артёму верифицированный файл core/schema.sql (см. раздел «Полная карта базы данных») и сверить соответствие полей TaskRun ↔ task_runs.
+Совместно с Алёнкой зафиксировать в docs/03_ui_design.md пользовательские сценарии для ролей RISK_ANALYST, RISK_
+MANAGER и ADMIN, а также структуру экранов в Figma: Главный дашборд (5 кнопок сценариев + тумблер «Без оркестратора / С оркестратором» + выбор пользователя + форма ручного запуска + 3 колонки задач + Гант + журнал) и Вкладка настроек (матрица конфликтов, р
+егламент, таблица сравнений «До/После»).
+Точка передачи (Gate 2):
+ Заморозить docs/02_system_requirements.md и согласовать финальный макет с Максимом (разработчик UI).
+Шаг 5. Подготовить план приёмочного тестирования и проверить синтетику (День 3)
+Проконтролировать совместно с Романом, что сгенерированные CSV-витрины при seed=42 содержат все ожидаемые риск-аномалии: шторм на М-11/М-12 и дефицит в Москве/Казани на 2026-11-20 (6 случаев), нарушение холодовой цепи в Краснодаре на 2026-11-20..21 (6 случ
+аев), 31 задержанный/остановленный рейс и 4 перевозчика в зонах риска SLA (C/CRITICAL, включая базово деградирующих CAR-04 и CAR-06).
+Сформировать приёмочный чек-лист из 6 тест-кейсов: прогон Сценариев 1–5 в обоих режимах (OFF и ON) плюс многовкладочный те
+ст (одновременные ручные запуски из двух окон браузера от analyst_1 и analyst_2 с закрытием одной вкладки во время расчёта).
+Шаг 6. Провести парные прогоны «До/После» и зафиксировать метрики защиты (День 4)
+Выполнить совместно с Романом и Максимом парные п
+рогоны всех 5 сценариев (orchestration_enabled = 0 и 1) и выгрузить итоговую сводку из SQL-представления v_before_after_comparison.
+Подготовить сводную таблицу фактических метрик для презентации: сопоставление доли сбоев (от базового уровня отказов в режим
+е «Без оркестратора» — в синтетическом суточном журнале старой системы падало 55,3% задач — к 0% ошибок под оркестратором), числа deadlock, Data Integrity Score и выигрыша в makespan за счёт параллелизма независимых дат.
+Шаг 7. Собрать контент для ИИ-презе
+нтации и провести аудит критериев жюри (День 5)
+Передать Алёнке проверенные артефакты для docs/04_presentation_prompt.md: распределение сбоев из логов, сравнительную таблицу 4 вариантов решения, скриншоты диаграммы Ганта и таблицу прогонов из v_before_afte
+r_comparison.
+Проверить чек-лист формальных требований кейса: полнота 4 документов в docs/, наличие промпта и вывода ИИ-анализа логов, наличие использованного ИИ-промпта презентации на финальном слайде (дополнительный балл), рабочее живое демо и записанное
+ резервное видео на 1,5–2 минуты.
+Скрипты для генерации синтетических данных
+Все три скрипта ниже используют исключительно стандартную библиотеку Python 3.11+ (csv, json, random, sqlite3, argparse, datetime, pathlib) и не требуют установки pandas, faker или numpy. Такой подход исключает проблемы сборки зависимостей и ускоряет развё
+ртывание на машине любого участника команды. Скрипты рекомендуется хранить в каталоге scripts/ и запускать с фиксированным seed=42 для воспроизводимости данных и результатов прогонов.
+Скрипт 1: Генератор связанных доменных витрин (scripts/generate_domain_d
+ata.py)
+Скрипт формирует 4 реляционно согласованные витрины за период 2026-11-18..2026-11-22 в synthetic_data/*.csv, а при указании флага --to-sqlite data/orchestrator.db транзакционно загружает их в доменные таблицы SQLite. При seed=42 создаётся ровно 316
+ записей (200 строк warehouse_stocks, 90 transit_telemetry, 20 weather_traffic, 6 supplier_sla) с программно внедрёнными аномалиями всех четырёх типов риска.
+#!/usr/bin/env python3
+"""
+Генератор связанных доменных витрин логистики (CSV + опционально SQLite
+).
+Стандартная библиотека Python 3.11+, детерминированный seed.
+Примеры запуска:
+    python scripts/generate_domain_data.py
+    python scripts/generate_domain_data.py --out-dir synthetic_data --to-sqlite data/orchestrator.db --seed 42
+"""
+from __future__ 
+import annotations
+import argparse
+import csv
+import random
+import sqlite3
+from datetime import date, timedelta
+from pathlib import Path
+WAREHOUSES: list[tuple[str, str, str]] = [
+    ("WH-MSK-01", "Москва-Север", "COR-MSK-SPB"),
+    ("WH-SPB-02", "Санкт
+-Петербург", "COR-MSK-SPB"),
+    ("WH-KZN-03", "Казань-Хаб", "COR-MSK-KZN"),
+    ("WH-EKB-04", "Екатеринбург", "COR-KZN-EKB"),
+    ("WH-KRR-05", "Краснодар-Юг", "COR-MSK-KRR"),
+]
+CORRIDORS: list[tuple[str, str]] = [
+    ("COR-MSK-SPB", "М-11 Москва — СПб"
+),
+    ("COR-MSK-KZN", "М-12 Москва — Казань"),
+    ("COR-KZN-EKB", "Р-242 Казань — Екатеринбург"),
+    ("COR-MSK-KRR", "М-4 Дон Москва — Краснодар"),
+]
+# (sku_id, category, is_perishable, norm_temp_c, reorder_point, avg_daily_demand)
+SKUS: list[tuple[str
+, str, bool, float, int, float]] = [
+    ("SKU-101", "DAIRY_FRESH", True, 4.0, 220, 45.0),
+    ("SKU-102", "MEAT_CHILLED", True, 2.0, 180, 35.0),
+    ("SKU-103", "PRODUCE_FRESH", True, 6.0, 300, 60.0),
+    ("SKU-201", "PHARMA_COLD", True, 5.0, 90, 18.0),
+ 
+   ("SKU-301", "BEVERAGES", False, 18.0, 500, 95.0),
+    ("SKU-302", "GROCERY_DRY", False, 20.0, 600, 110.0),
+    ("SKU-401", "ELECTRONICS", False, 20.0, 80, 12.0),
+    ("SKU-402", "HOUSEHOLD", False, 20.0, 350, 65.0),
+]
+# (carrier_id, carrier_name, base_
+on_time_rate, base_claim_rate)
+CARRIERS: list[tuple[str, str, float, float]] = [
+    ("CAR-01", "СеверТранс Логистик", 0.96, 0.012),
+    ("CAR-02", "ВолгаЭкспресс", 0.91, 0.025),
+    ("CAR-03", "УралФрахт", 0.85, 0.045),
+    ("CAR-04", "ЮгКарго Плюс", 0.72
+, 0.088),
+    ("CAR-05", "Магистраль-24", 0.94, 0.018),
+    ("CAR-06", "ЭкспрессРейл", 0.64, 0.115),
+]
+DDL_DOMAIN = """
+CREATE TABLE IF NOT EXISTS dom_warehouse_stocks (
+    record_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_date       
+  TEXT NOT NULL,
+    warehouse_id          TEXT NOT NULL,
+    sku_id                TEXT NOT NULL,
+    sku_category          TEXT NOT NULL,
+    qty_on_hand           INTEGER NOT NULL CHECK (qty_on_hand >= 0),
+    qty_reserved          INTEGER NOT NULL DEFA
+ULT 0,
+    reorder_point         INTEGER NOT NULL,
+    avg_daily_demand      REAL NOT NULL,
+    expiry_date           TEXT,
+    temp_celsius          REAL,
+    stockout_risk_flag    INTEGER NOT NULL DEFAULT 0,
+    spoilage_risk_flag    INTEGER NOT NULL DEF
+AULT 0,
+    row_version           INTEGER NOT NULL DEFAULT 1,
+    updated_by_task_id    INTEGER,
+    UNIQUE (business_date, warehouse_id, sku_id)
+);
+CREATE TABLE IF NOT EXISTS dom_transit_telemetry (
+    shipment_id           TEXT NOT NULL,
+    business_da
+te         TEXT NOT NULL,
+    carrier_id            TEXT NOT NULL,
+    warehouse_id          TEXT NOT NULL,
+    sku_id                TEXT NOT NULL,
+    corridor_id           TEXT NOT NULL,
+    planned_eta_hours     REAL NOT NULL,
+    actual_eta_hours     
+ REAL NOT NULL,
+    cargo_qty             INTEGER NOT NULL,
+    cargo_temp_celsius    REAL,
+    gps_status            TEXT NOT NULL CHECK (gps_status IN ('ON_TIME', 'DELAYED', 'STOPPED', 'REROUTED')),
+    delay_risk_score      REAL NOT NULL DEFAULT 0.0,
+  
+  row_version           INTEGER NOT NULL DEFAULT 1,
+    updated_by_task_id    INTEGER,
+    PRIMARY KEY (business_date, shipment_id)
+);
+CREATE TABLE IF NOT EXISTS dom_weather_traffic (
+    business_date         TEXT NOT NULL,
+    corridor_id           TEXT 
+NOT NULL,
+    region_name           TEXT NOT NULL,
+    weather_severity      REAL NOT NULL CHECK (weather_severity BETWEEN 0.0 AND 1.0),
+    temp_ambient_celsius  REAL NOT NULL,
+    traffic_congestion    REAL NOT NULL CHECK (traffic_congestion BETWEEN 0.0 
+AND 1.0),
+    road_alert_code       TEXT NOT NULL DEFAULT 'NONE',
+    PRIMARY KEY (business_date, corridor_id)
+);
+CREATE TABLE IF NOT EXISTS dom_supplier_sla (
+    carrier_id            TEXT PRIMARY KEY,
+    carrier_name          TEXT NOT NULL,
+    as_of_d
+ate            TEXT NOT NULL,
+    rolling_window_days   INTEGER NOT NULL DEFAULT 30,
+    on_time_rate          REAL NOT NULL CHECK (on_time_rate BETWEEN 0.0 AND 1.0),
+    claim_rate            REAL NOT NULL CHECK (claim_rate BETWEEN 0.0 AND 1.0),
+    activ
+e_shipments      INTEGER NOT NULL DEFAULT 0,
+    default_risk_score    REAL NOT NULL DEFAULT 0.0,
+    sla_tier              TEXT NOT NULL CHECK (sla_tier IN ('A', 'B', 'C', 'CRITICAL')),
+    row_version           INTEGER NOT NULL DEFAULT 1,
+    updated_by_
+task_id    INTEGER
+);
+"""
+def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+   
+     writer.writerows(rows)
+def load_csvs_to_sqlite(csv_dir: Path, db_path: Path) -> dict[str, int]:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode = W
+AL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.executescript(DDL_DOMAIN)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    mapping = [
+        (
+"weather_traffic.csv", "dom_weather_traffic"),
+        ("warehouse_stocks.csv", "dom_warehouse_stocks"),
+        ("transit_telemetry.csv", "dom_transit_telemetry"),
+        ("supplier_sla.csv", "dom_supplier_sla"),
+    ]
+    loaded: dict[str, int] = {}
+   
+ conn.execute("BEGIN;")
+    try:
+        for fname, table in mapping:
+            with (csv_dir / fname).open("r", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+            if not rows:
+                loaded[table] = 0
+         
+       continue
+            cols = list(rows[0].keys())
+            placeholders = ", ".join("?" for _ in cols)
+            sql = f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) VALUES ({placeholders})"
+            conn.executemany(sql, [[r[c] for c i
+n cols] for r in rows])
+            loaded[table] = len(rows)
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.close()
+    return loaded
+def generate_domain_datasets(
+    out_
+dir: Path,
+    start_date: date = date(2026, 11, 18),
+    num_days: int = 5,
+    shipments_per_day: int = 18,
+    seed: int = 42,
+    sqlite_path: Path | None = None,
+) -> dict[str, int]:
+    rng = random.Random(seed)
+    out_dir.mkdir(parents=True, exist_
+ok=True)
+    dates = [start_date + timedelta(days=i) for i in range(num_days)]
+    weather_rows: list[dict[str, object]] = []
+    stock_rows: list[dict[str, object]] = []
+    transit_rows: list[dict[str, object]] = []
+    sla_rows: list[dict[str, object]]
+ = []
+    weather_index: dict[tuple[str, str], dict[str, object]] = {}
+    shipment_seq = 1000
+    # 1. Витрина WeatherAndTraffic (партиционирована по датам и коридорам)
+    for d in dates:
+        d_str = d.isoformat()
+        for cor_id, region in CORR
+IDORS:
+            if d == date(2026, 11, 20) and cor_id in ("COR-MSK-SPB", "COR-MSK-KZN"):
+                severity = round(rng.uniform(0.82, 0.96), 2)
+                congestion = round(rng.uniform(0.78, 0.95), 2)
+                temp_amb = round(rng.uni
+form(-14.0, -7.0), 1)
+                alert = "BLIZZARD_SEVERE"
+            elif d == date(2026, 11, 21) and cor_id == "COR-MSK-KRR":
+                severity = round(rng.uniform(0.55, 0.75), 2)
+                congestion = round(rng.uniform(0.72, 0.88), 2
+)
+                temp_amb = round(rng.uniform(22.0, 27.0), 1)
+                alert = "ROADWORK_CONGESTION"
+            else:
+                severity = round(rng.uniform(0.05, 0.42), 2)
+                congestion = round(rng.uniform(0.15, 0.55), 2)
+     
+           temp_amb = round(rng.uniform(-4.0, 9.0), 1)
+                alert = "NONE"
+            row: dict[str, object] = {
+                "business_date": d_str,
+                "corridor_id": cor_id,
+                "region_name": region,
+            
+    "weather_severity": severity,
+                "temp_ambient_celsius": temp_amb,
+                "traffic_congestion": congestion,
+                "road_alert_code": alert,
+            }
+            weather_rows.append(row)
+            weather_index[(d_
+str, cor_id)] = row
+    # 2. Витрина WarehouseStocks (партиционирована по датам, складам и SKU)
+    for d in dates:
+        d_str = d.isoformat()
+        for wh_id, _wh_name, _cor_id in WAREHOUSES:
+            for sku_id, cat, is_perishable, norm_temp, re
+order_pt, avg_demand in SKUS:
+                if (
+                    d == date(2026, 11, 20)
+                    and wh_id in ("WH-MSK-01", "WH-KZN-03")
+                    and sku_id in ("SKU-101", "SKU-201", "SKU-401")
+                ):
+              
+      qty_on_hand = rng.randint(5, max(10, int(reorder_pt * 0.35)))
+                    qty_reserved = min(qty_on_hand, rng.randint(5, max(6, int(qty_on_hand * 0.8))))
+                else:
+                    qty_on_hand = rng.randint(int(reorder_pt * 0.8
+5), int(reorder_pt * 3.2))
+                    qty_reserved = rng.randint(0, int(qty_on_hand * 0.3))
+                if is_perishable:
+                    if (
+                        d in (date(2026, 11, 20), date(2026, 11, 21))
+                        a
+nd wh_id == "WH-KRR-05"
+                        and sku_id in ("SKU-101", "SKU-102", "SKU-201")
+                    ):
+                        expiry = (d + timedelta(days=rng.randint(1, 2))).isoformat()
+                        temp_c = round(norm_temp + r
+ng.uniform(5.5, 9.0), 1)
+                    else:
+                        expiry = (d + timedelta(days=rng.randint(4, 21))).isoformat()
+                        temp_c = round(norm_temp + rng.uniform(-1.0, 1.2), 1)
+                else:
+                   
+ expiry = (d + timedelta(days=rng.randint(180, 540))).isoformat()
+                    temp_c = round(norm_temp + rng.uniform(-2.0, 2.0), 1)
+                stock_rows.append({
+                    "business_date": d_str,
+                    "warehouse_id":
+ wh_id,
+                    "sku_id": sku_id,
+                    "sku_category": cat,
+                    "qty_on_hand": qty_on_hand,
+                    "qty_reserved": qty_reserved,
+                    "reorder_point": reorder_pt,
+                    "a
+vg_daily_demand": round(avg_demand * rng.uniform(0.85, 1.2), 1),
+                    "expiry_date": expiry,
+                    "temp_celsius": temp_c,
+                    "stockout_risk_flag": 0,
+                    "spoilage_risk_flag": 0,
+              
+      "row_version": 1,
+                })
+    # 3. Витрина TransitTelemetry (связывает перевозчика, склад, SKU и коридор)
+    carrier_stats: dict[str, list[bool]] = {c[0]: [] for c in CARRIERS}
+    for d in dates:
+        d_str = d.isoformat()
+        fo
+r _ in range(shipments_per_day):
+            shipment_seq += 1
+            wh_id, _wh_name, cor_id = rng.choice(WAREHOUSES)
+            sku_id, _cat, is_perishable, norm_temp, _rp, _dem = rng.choice(SKUS)
+            car_id, _car_name, base_ot, _base_claim
+ = rng.choice(CARRIERS)
+            w = weather_index[(d_str, cor_id)]
+            w_sev = float(w["weather_severity"])
+            t_cong = float(w["traffic_congestion"])
+            planned_eta = round(rng.uniform(8.0, 36.0), 1)
+            delay_prob =
+ (1.0 - base_ot) + 0.45 * w_sev + 0.25 * t_cong
+            is_delayed = rng.random() < min(0.95, delay_prob)
+            if is_delayed:
+                extra_hours = round(rng.uniform(2.5, 18.0) * (1.0 + w_sev), 1)
+                actual_eta = round(plann
+ed_eta + extra_hours, 1)
+                gps_status = (
+                    "STOPPED"
+                    if w_sev > 0.8
+                    else ("REROUTED" if rng.random() < 0.3 else "DELAYED")
+                )
+            else:
+                actual_e
+ta = round(planned_eta + rng.uniform(-1.0, 0.8), 1)
+                gps_status = "ON_TIME"
+            carrier_stats[car_id].append(not is_delayed)
+            temp_shift = rng.uniform(3.0, 7.0) if (is_perishable and is_delayed) else rng.uniform(-0.8, 0.8
+)
+            transit_rows.append({
+                "shipment_id": f"SHP-{d.strftime('%m%d')}-{shipment_seq}",
+                "business_date": d_str,
+                "carrier_id": car_id,
+                "warehouse_id": wh_id,
+                "sku_id": sk
+u_id,
+                "corridor_id": cor_id,
+                "planned_eta_hours": planned_eta,
+                "actual_eta_hours": actual_eta,
+                "cargo_qty": rng.randint(40, 450),
+                "cargo_temp_celsius": round(norm_temp + temp_s
+hift, 1),
+                "gps_status": gps_status,
+                "delay_risk_score": 0.0,
+                "row_version": 1,
+            })
+    # 4. Витрина SupplierSLA (глобальная кумулятивная витрина за 30 дней)
+    latest_date_str = dates[-1].isoform
+at()
+    for car_id, car_name, base_ot, base_claim in CARRIERS:
+        outcomes = carrier_stats[car_id]
+        obs_ot = sum(outcomes) / len(outcomes) if outcomes else base_ot
+        rolling_ot = round(0.65 * base_ot + 0.35 * obs_ot, 3)
+        claim_rat
+e = round(base_claim * rng.uniform(0.9, 1.15), 3)
+        if rolling_ot >= 0.92:
+            tier = "A"
+        elif rolling_ot >= 0.82:
+            tier = "B"
+        elif rolling_ot >= 0.70:
+            tier = "C"
+        else:
+            tier = "CRITIC
+AL"
+        sla_rows.append({
+            "carrier_id": car_id,
+            "carrier_name": car_name,
+            "as_of_date": latest_date_str,
+            "rolling_window_days": 30,
+            "on_time_rate": rolling_ot,
+            "claim_rate": claim_
+rate,
+            "active_shipments": len(outcomes),
+            "default_risk_score": 0.0,
+            "sla_tier": tier,
+            "row_version": 1,
+        })
+    write_csv(out_dir / "weather_traffic.csv", weather_rows)
+    write_csv(out_dir / "wareho
+use_stocks.csv", stock_rows)
+    write_csv(out_dir / "transit_telemetry.csv", transit_rows)
+    write_csv(out_dir / "supplier_sla.csv", sla_rows)
+    summary = {
+        "weather_traffic": len(weather_rows),
+        "warehouse_stocks": len(stock_rows),
+  
+      "transit_telemetry": len(transit_rows),
+        "supplier_sla": len(sla_rows),
+        "anomalies_stockout": sum(
+            1
+            for r in stock_rows
+            if (int(r["qty_on_hand"]) - int(r["qty_reserved"])) < int(r["reorder_point"]) 
+* 0.5
+        ),
+        "anomalies_spoilage": sum(
+            1
+            for r in stock_rows
+            if str(r["sku_category"]) in ("DAIRY_FRESH", "MEAT_CHILLED", "PRODUCE_FRESH", "PHARMA_COLD")
+            and float(r["temp_celsius"]) > 8.5
+      
+  ),
+        "anomalies_delay": sum(1 for r in transit_rows if str(r["gps_status"]) in ("DELAYED", "STOPPED")),
+        "anomalies_carrier_sla": sum(1 for r in sla_rows if str(r["sla_tier"]) in ("C", "CRITICAL")),
+    }
+    if sqlite_path is not None:
+    
+    load_csvs_to_sqlite(out_dir, sqlite_path)
+    return summary
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Генерация синтетических логистических витрин.")
+    parser.add_argument("--out-dir", type=Path, default=Path("synthetic
+_data"))
+    parser.add_argument("--start-date", type=date.fromisoformat, default=date(2026, 11, 18))
+    parser.add_argument("--days", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--to-sqlite", type
+=Path, default=None)
+    args = parser.parse_args()
+    stats = generate_domain_datasets(
+        out_dir=args.out_dir,
+        start_date=args.start_date,
+        num_days=args.days,
+        seed=args.seed,
+        sqlite_path=args.to_sqlite,
+    )
+    p
+rint("Доменные витрины сгенерированы:", stats)
+if __name__ == "__main__":
+    main()
+Скрипт 2: Генератор сбойных логов «старой системы» (scripts/generate_legacy_logs.py)
+Скрипт генерирует суточный журнал «старой системы» из 86 событий (51 INFO, 14 WARN,
+ 21 ERROR) сразу в двух форматах — текстовом (legacy_system_logs.log) для вставки в LLM-промпт и машиночитаемом (legacy_system_logs.jsonl) для сверки статистики. В логе воспроизведены 4 эпизода AB-BA deadlock (8 аварийных завершений), 3 эпизода коллизии st
+aging-буфера за разные даты (6 ошибок), 4 эпизода Lost Update (ручной запуск поверх регламента) и 3 эпизода грязного чтения глобальной витрины SupplierSLA.
+#!/usr/bin/env python3
+"""
+Генератор синтетических сбойных логов «старой системы» (86 событий)
+для в
+оспроизводимого ИИ-анализа узких мест (TXT + JSONL).
+Запуск:
+    python scripts/generate_legacy_logs.py --out-dir synthetic_data --seed 42
+"""
+from __future__ import annotations
+import argparse
+import json
+import random
+from collections import Counter
+fr
+om datetime import datetime, timedelta, timezone
+from pathlib import Path
+def generate_legacy_logs(
+    out_dir: Path,
+    seed: int = 42,
+    start_ts: datetime = datetime(2026, 11, 20, 6, 0, 0, tzinfo=timezone.utc),
+) -> dict[str, object]:
+    rng = ra
+ndom.Random(seed)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    events: list[dict[str, object]] = []
+    ts = start_ts
+    job_id = 100
+    def emit(
+        level: str,
+        service: str,
+        trigger: str,
+        user_id: str,
+        targe
+t_date: str,
+        action: str,
+        message: str,
+        resources: list[str],
+        error_code: str | None = None,
+        incident_type: str | None = None,
+        jid: int | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+  
+      nonlocal ts
+        ts += timedelta(milliseconds=rng.randint(350, 2400))
+        events.append({
+            "timestamp": ts.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "level": level,
+            "job_id": jid,
+           
+ "service": service,
+            "trigger": trigger,
+            "user_id": user_id,
+            "target_date": target_date,
+            "action": action,
+            "resources": resources,
+            "error_code": error_code,
+            "incident_type"
+: incident_type,
+            "duration_ms": duration_ms,
+            "message": message,
+        })
+    def add_normal_run(service: str, trigger: str, user_id: str, target_date: str, res: list[str]) -> None:
+        nonlocal job_id
+        job_id += 1
+   
+     jid = job_id
+        emit("INFO", service, trigger, user_id, target_date, "START",
+             f"Job #{jid} started ({trigger} by {user_id}) for {target_date}", res, jid=jid)
+        emit("INFO", service, trigger, user_id, target_date, "COMPLETE",
+  
+           f"Job #{jid} finished successfully; rows_updated={rng.randint(18, 95)}", res,
+             jid=jid, duration_ms=rng.randint(2800, 4900))
+    def add_abba_deadlock(target_date: str, user_a: str, user_b: str, trig_a: str = "AUTO", trig_b: str = "
+MANUAL") -> None:
+        nonlocal job_id
+        job_id += 1
+        ja = job_id
+        job_id += 1
+        jb = job_id
+        emit("INFO", "StockoutRisk", trig_a, user_a, target_date, "LOCK_ACQUIRE",
+             f"Job #{ja} acquired EXCLUSIVE lock on 
+WarehouseStocks({target_date})",
+             ["WarehouseStocks"], jid=ja)
+        emit("INFO", "DelayRisk", trig_b, user_b, target_date, "LOCK_ACQUIRE",
+             f"Job #{jb} acquired EXCLUSIVE lock on TransitTelemetry({target_date})",
+             ["T
+ransitTelemetry"], jid=jb)
+        emit("WARN", "StockoutRisk", trig_a, user_a, target_date, "LOCK_WAIT",
+             f"Job #{ja} waiting for READ lock on TransitTelemetry({target_date}) held by Job #{jb}",
+             ["WarehouseStocks", "TransitTelemet
+ry"], jid=ja)
+        emit("WARN", "DelayRisk", trig_b, user_b, target_date, "LOCK_WAIT",
+             f"Job #{jb} waiting for READ lock on WarehouseStocks({target_date}) held by Job #{ja}",
+             ["TransitTelemetry", "WarehouseStocks"], jid=jb)
+   
+     emit("ERROR", "StockoutRisk", trig_a, user_a, target_date, "ABORT_DEADLOCK",
+             f"DeadlockError: cyclic wait detected between Job #{ja} (StockoutRisk) and Job #{jb} (DelayRisk) on WarehouseStocks<->TransitTelemetry ({target_date})",
+        
+     ["WarehouseStocks", "TransitTelemetry"], error_code="ERR_DEADLOCK_ABBA",
+             incident_type="AB_BA_DEADLOCK", jid=ja, duration_ms=rng.randint(8000, 12000))
+        emit("ERROR", "DelayRisk", trig_b, user_b, target_date, "ABORT_DEADLOCK",
+     
+        f"DeadlockError: transaction rolled back for Job #{jb} after wait timeout 10s",
+             ["TransitTelemetry", "WarehouseStocks"], error_code="ERR_DEADLOCK_ABBA",
+             incident_type="AB_BA_DEADLOCK", jid=jb, duration_ms=rng.randint(8000,
+ 12000))
+    def add_lost_update_race(target_date: str, user_manual: str) -> None:
+        nonlocal job_id
+        job_id += 1
+        j_auto = job_id
+        job_id += 1
+        j_man = job_id
+        emit("INFO", "StockoutRisk", "AUTO", "scheduler_bot",
+ target_date, "SNAPSHOT_READ",
+             f"Job #{j_auto} (AUTO reglament) read WarehouseStocks({target_date}) row_version=1",
+             ["WarehouseStocks", "TransitTelemetry", "SupplierSLA"], jid=j_auto)
+        emit("INFO", "SpoilageRisk", "MANUAL",
+ user_manual, target_date, "SNAPSHOT_READ",
+             f"Job #{j_man} (MANUAL by {user_manual}) overlapped reglament and read stale WarehouseStocks({target_date}) row_version=1",
+             ["WarehouseStocks", "WeatherAndTraffic"], jid=j_man)
+        e
+mit("INFO", "StockoutRisk", "AUTO", "scheduler_bot", target_date, "COMMIT",
+             f"Job #{j_auto} committed stockout_risk_flag to WarehouseStocks({target_date}), row_version=2",
+             ["WarehouseStocks"], jid=j_auto, duration_ms=rng.randint(3
+200, 4500))
+        emit("ERROR", "SpoilageRisk", "MANUAL", user_manual, target_date, "OVERWRITE_CONFLICT",
+             f"DataCorruptionError: Lost Update detected! Job #{j_man} overwrote WarehouseStocks({target_date}) from version=1->3, erasing stockout_
+risk_flag written by Job #{j_auto}",
+             ["WarehouseStocks"], error_code="ERR_LOST_UPDATE",
+             incident_type="MANUAL_VS_REGLAMENT_LOST_UPDATE", jid=j_man, duration_ms=rng.randint(3600, 5100))
+    def add_cross_date_staging_collision(dat
+e_a: str, date_b: str, user_a: str, user_b: str) -> None:
+        nonlocal job_id
+        job_id += 1
+        ja = job_id
+        job_id += 1
+        jb = job_id
+        emit("INFO", "CarrierDefaultRisk", "MANUAL", user_a, date_a, "STAGING_TRUNCATE",
+     
+        f"Job #{ja} cleared staging_carrier_sla_rolling and loaded 30d window for {date_a}",
+             ["SupplierSLA", "staging_carrier_sla_rolling", "TransitTelemetry"], jid=ja)
+        emit("WARN", "CarrierDefaultRisk", "MANUAL", user_b, date_b, "STAG
+ING_TRUNCATE",
+             f"Job #{jb} concurrently truncated staging_carrier_sla_rolling for {date_b} while Job #{ja} still aggregating!",
+             ["SupplierSLA", "staging_carrier_sla_rolling", "TransitTelemetry"], jid=jb)
+        emit("ERROR", "Car
+rierDefaultRisk", "MANUAL", user_a, date_a, "CORRUPT_AGGREGATE",
+             f"CrossDateCollisionError: mixed business_dates ({date_a} & {date_b}) in staging_carrier_sla_rolling; SupplierSLA rolling on_time_rate corrupted",
+             ["SupplierSLA", "s
+taging_carrier_sla_rolling"], error_code="ERR_CROSS_DATE_STAGING",
+             incident_type="CROSS_DATE_COLLISION", jid=ja, duration_ms=rng.randint(4100, 6000))
+        emit("ERROR", "CarrierDefaultRisk", "MANUAL", user_b, date_b, "CORRUPT_AGGREGATE",
+  
+           f"CrossDateCollisionError: Job #{jb} aborted due to staging ownership mismatch with Job #{ja}",
+             ["SupplierSLA", "staging_carrier_sla_rolling"], error_code="ERR_CROSS_DATE_STAGING",
+             incident_type="CROSS_DATE_COLLISION", 
+jid=jb, duration_ms=rng.randint(4100, 6000))
+    def add_cross_date_dirty_read(date_writer: str, date_reader: str, user_w: str, user_r: str) -> None:
+        nonlocal job_id
+        job_id += 1
+        jw = job_id
+        job_id += 1
+        jr = job_id
+ 
+       emit("INFO", "CarrierDefaultRisk", "AUTO", user_w, date_writer, "WRITE_BEGIN",
+             f"Job #{jw} started rewriting global mart SupplierSLA for {date_writer} (partial rows updated)",
+             ["SupplierSLA"], jid=jw)
+        emit("WARN", "
+DelayRisk", "MANUAL", user_r, date_reader, "DIRTY_READ",
+             f"Job #{jr} read partially updated global mart SupplierSLA while Job #{jw} writing ({date_writer} vs {date_reader})",
+             ["SupplierSLA", "TransitTelemetry"], jid=jr)
+        em
+it("ERROR", "DelayRisk", "MANUAL", user_r, date_reader, "DATA_QUALITY_FAIL",
+             f"DataCorruptionError: inconsistent SupplierSLA snapshot (checksum mismatch 
+between CAR-04 and CAR-06) during DelayRisk({date_reader})",
+             ["SupplierSLA", 
+"TransitTelemetry"], error_code="ERR_DIRTY_READ_GLOBAL",
+             incident_type="CROSS_DATE_DIRTY_READ", jid=jr, duration_ms=rng.randint(2900, 4200))
+        emit("INFO", "CarrierDefaultRisk", "AUTO", user_w, date_writer, "COMMIT",
+             f"Job #
+{jw} finished writing SupplierSLA (downstream DelayRisk #{jr} already corrupted)",
+             ["SupplierSLA"], jid=jw, duration_ms=rng.randint(4500, 5800))
+    # Сборка суточного цикла (86 событий, 38 задач)
+    add_normal_run("SpoilageRisk", "AUTO", "s
+cheduler_bot", "2026-11-19", ["WeatherAndTraffic", "WarehouseStocks"])
+    add_normal_run("CarrierDefaultRisk", "AUTO", "scheduler_bot", "2026-11-19", ["TransitTelemetry", "WeatherAndTraffic", "SupplierSLA"])
+    add_normal_run("DelayRisk", "MANUAL", "anal
+yst_1", "2026-11-19", ["WeatherAndTraffic", "SupplierSLA", "WarehouseStocks", "TransitTelemetry"])
+    add_lost_update_race("2026-11-20", "analyst_1")
+    add_normal_run("SpoilageRisk", "MANUAL", "analyst_2", "2026-11-18", ["WeatherAndTraffic", "WarehouseS
+tocks"])
+    add_abba_deadlock("2026-11-20", "scheduler_bot", "analyst_2", "AUTO", "MANUAL")
+    add_cross_date_staging_collision("2026-11-19", "2026-11-20", "analyst_1", "manager_1")
+    add_normal_run("StockoutRisk", "MANUAL", "analyst_1", "2026-11-18", 
+["SupplierSLA", "TransitTelemetry", "WarehouseStocks"])
+    add_abba_deadlock("2026-11-20", "analyst_1", "manager_1", "MANUAL", "MANUAL")
+    add_cross_date_dirty_read("2026-11-20", "2026-11-19", "scheduler_bot", "analyst_2")
+    add_lost_update_race("2026
+-11-20", "analyst_2")
+    add_normal_run("DelayRisk", "AUTO", "scheduler_bot", "2026-11-18", ["WeatherAndTraffic", "SupplierSLA", "WarehouseStocks", "TransitTelemetry"])
+    add_cross_date_staging_collision("2026-11-20", "2026-11-21", "analyst_2", "analyst
+_1")
+    add_abba_deadlock("2026-11-21", "scheduler_bot", "analyst_1", "AUTO", "MANUAL")
+    add_cross_date_dirty_read("2026-11-21", "2026-11-20", "scheduler_bot", "manager_1")
+    add_lost_update_race("2026-11-21", "manager_1")
+    add_cross_date_staging_
+collision("2026-11-18", "2026-11-21", "manager_1", "analyst_2")
+    add_normal_run("SpoilageRisk", "AUTO", "scheduler_bot", "2026-11-21", ["WeatherAndTraffic", "WarehouseStocks"])
+    add_abba_deadlock("2026-11-21", "analyst_2", "analyst_1", "MANUAL", "MAN
+UAL")
+    add_normal_run("StockoutRisk", "AUTO", "scheduler_bot", "2026-11-22", ["SupplierSLA", "TransitTelemetry", "WarehouseStocks"])
+    add_lost_update_race("2026-11-22", "analyst_1")
+    add_cross_date_dirty_read("2026-11-22", "2026-11-21", "scheduler
+_bot", "analyst_1")
+    add_normal_run("DelayRisk", "MANUAL", "manager_1", "2026-11-22", ["WeatherAndTraffic", "SupplierSLA", "WarehouseStocks", "TransitTelemetry"])
+    add_normal_run("CarrierDefaultRisk", "AUTO", "scheduler_bot", "2026-11-22", ["TransitT
+elemetry", "WeatherAndTraffic", "SupplierSLA"])
+    add_normal_run("SpoilageRisk", "MANUAL", "analyst_2", "2026-11-22", ["WeatherAndTraffic", "WarehouseStocks"])
+    jsonl_path = out_dir / "legacy_system_logs.jsonl"
+    txt_path = out_dir / "legacy_system
+_logs.log"
+    with jsonl_path.open("w", encoding="utf-8") as fj, txt_path.open("w", encoding="utf-8") as ft:
+        for ev in events:
+            fj.write(json.dumps(ev, ensure_ascii=False) + "\n")
+            err = f" code={ev['error_code']}" if ev["err
+or_code"] else ""
+            ft.write(
+                f"{ev['timestamp']} [{str(ev['level']):5s}] job=#{ev['job_id']} "
+                f"svc={str(ev['service']):18s} trig={str(ev['trigger']):6s} user={str(ev['user_id']):13s} "
+                f"date={ev
+['target_date']} action={ev['action']}{err} | {ev['message']}\n"
+            )
+    return {
+        "total_events": len(events),
+        "levels": dict(Counter(str(e["level"]) for e in events)),
+        "incidents": dict(Counter(str(e["incident_type"]) fo
+r e in events if e["incident_type"])),
+    }
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Генерация синтетических сбойных логов старой системы.")
+    parser.add_argument("--out-dir", type=Path, default=Path("synthetic_data"))
+   
+ parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    summary = generate_legacy_logs(args.out_dir, seed=args.seed)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+if __name__ == "__main__":
+    main()
+Скрип
+т 3: Генератор демо-сценариев и стресс-батчей (scripts/generate_scenarios.py)
+Скрипт выгружает в synthetic_data/scenarios.json все 5 канонических демо-сценариев (включая сценарий безопасного параллелизма s4_parallel_safe и многопользовательский стресс-тест
+ s5_multiuser_storm на 10 задач) плюс параметрический случайный стресс-батч с управляемым коэффициентом концентрации коллизий conflict_bias. Скрипт использует строковые значения триггеров ("AUTO" / "MANUAL") для автономной сериализации без импорта core.mod
+els; при загрузке в services/scenarios.py они напрямую преобразуются в TriggerType(task["trigger"]).
+#!/usr/bin/env python3
+"""
+Генератор 5 канонических демо-сценариев и параметрических стресс-батчей (JSON).
+Запуск:
+    python scripts/generate_scenarios.py
+ --out synthetic_data/scenarios.json --random-count 15 --seed 42
+"""
+from __future__ import annotations
+import argparse
+import json
+import random
+from dataclasses import asdict, dataclass
+from pathlib import Path
+PROCESS_IDS: tuple[str, ...] = (
+    "Sto
+ckoutRisk",
+    "DelayRisk",
+    "SpoilageRisk",
+    "CarrierDefaultRisk",
+)
+DEMO_DATES: tuple[str, ...] = (
+    "2026-11-18",
+    "2026-11-19",
+    "2026-11-20",
+    "2026-11-21",
+    "2026-11-22",
+)
+@dataclass
+class ScenarioTask:
+    process_id: str
+ 
+   target_date: str
+    trigger: str  # "AUTO" | "MANUAL"
+    priority: int
+    delay_sec: float = 0.0
+    initiated_by: str = "analyst_1"
+@dataclass
+class ScenarioBundle:
+    scenario_id: str
+    title: str
+    description: str
+    tasks: list[ScenarioT
+ask]
+def build_demo_scenarios() -> list[ScenarioBundle]:
+    return [
+        ScenarioBundle(
+            scenario_id="s1_manual_vs_reglament",
+            title="Сценарий 1: Ручной vs Регламент (Lost Update + Дубль)",
+            description="Ночной рег
+ламент StockoutRisk и одновременный ручной запуск SpoilageRisk + дубль StockoutRisk за 2026-11-20.",
+            tasks=[
+                ScenarioTask("StockoutRisk", "2026-11-20", "AUTO", 1, 0.0, "scheduler_bot"),
+                ScenarioTask("SpoilageRisk
+", "2026-11-20", "MANUAL", 2, 0.05, "analyst_1"),
+                ScenarioTask("StockoutRisk", "2026-11-20", "MANUAL", 2, 0.08, "analyst_2"),
+            ],
+        ),
+        ScenarioBundle(
+            scenario_id="s2_abba_deadlock",
+            title="С
+ценарий 2: Взаимная блокировка AB-BA (Deadlock)",
+            description="Одновременный запуск StockoutRisk и DelayRisk за 2026-11-20 с противоположным порядком захвата WarehouseStocks <-> TransitTelemetry.",
+            tasks=[
+                ScenarioTa
+sk("StockoutRisk", "2026-11-20", "AUTO", 1, 0.0, "scheduler_bot"),
+                ScenarioTask("DelayRisk", "2026-11-20", "MANUAL", 2, 0.02, "analyst_2"),
+            ],
+        ),
+        ScenarioBundle(
+            scenario_id="s3_cross_date_collision",
+            title="Сценарий 3: Перекрёстные даты и глобальный SLA",
+            description="Два пользователя запускают CarrierDefaultRisk за разные даты (общий staging) + DelayRisk читает глобальную витрину SupplierSLA.",
+            tasks=[
+            
+    ScenarioTask("CarrierDefaultRisk", "2026-11-19", "MANUAL", 2, 0.0, "analyst_1"),
+                ScenarioTask("CarrierDefaultRisk", "2026-11-20", "MANUAL", 2, 0.04, "manager_1"),
+                ScenarioTask("DelayRisk", "2026-11-21", "MANUAL", 2, 0.06
+, "analyst_2"),
+            ],
+        ),
+        ScenarioBundle(
+            scenario_id="s4_parallel_safe",
+            title="Сценарий 4: Безопасный параллелизм (разные даты и READ+READ)",
+            description="Независимые процессы и партиционированн
+ые даты (SpoilageRisk 11-18, 11-19 + DelayRisk 11-22) стартуют строго одновременно.",
+            tasks=[
+                ScenarioTask("SpoilageRisk", "2026-11-18", "MANUAL", 2, 0.0, "analyst_1"),
+                ScenarioTask("SpoilageRisk", "2026-11-19", 
+"MANUAL", 2, 0.0, "analyst_2"),
+                ScenarioTask("DelayRisk", "2026-11-22", "MANUAL", 2, 0.0, "manager_1"),
+            ],
+        ),
+        ScenarioBundle(
+            scenario_id="s5_multiuser_storm",
+            title="Сценарий 5: Стресс-те
+ст «Шторм пользователей» (10 задач)",
+            description="Регламент и 3 аналитика одновременно вбрасывают 10 задач: AB-BA, Lost Update, глобальный SLA, дубль и независимые даты.",
+            tasks=[
+                ScenarioTask("StockoutRisk", "2026-
+11-20", "AUTO", 1, 0.0, "scheduler_bot"),
+                ScenarioTask("DelayRisk", "2026-11-20", "MANUAL", 2, 0.02, "analyst_1"),
+                ScenarioTask("SpoilageRisk", "2026-11-20", "MANUAL", 2, 0.03, "analyst_2"),
+                ScenarioTask("Car
+rierDefaultRisk", "2026-11-20", "AUTO", 1, 0.05, "scheduler_bot"),
+                ScenarioTask("CarrierDefaultRisk", "2026-11-19", "MANUAL", 3, 0.06, "manager_1"),
+                ScenarioTask("SpoilageRisk", "2026-11-18", "MANUAL", 2, 0.07, "analyst_1"),
+                ScenarioTask("DelayRisk", "2026-11-21", "MANUAL", 3, 0.08, "analyst_2"),
+                ScenarioTask("StockoutRisk", "2026-11-20", "MANUAL", 2, 0.09, "analyst_1"),
+                ScenarioTask("SpoilageRisk", "2026-11-22", "MANUAL", 3, 0.
+10, "manager_1"),
+                ScenarioTask("StockoutRisk", "2026-11-21", "MANUAL", 2, 0.12, "analyst_2"),
+            ],
+        ),
+    ]
+def generate_random_batch(
+    count: int = 15,
+    seed: int = 42,
+    conflict_bias: float = 0.65,
+) -> list[S
+cenarioTask]:
+    rng = random.Random(seed)
+    users = ("analyst_1", "analyst_2", "manager_1")
+    hot_date = DEMO_DATES[len(DEMO_DATES) // 2]  # 2026-11-20 — пиковая дата коллизий
+    batch: list[ScenarioTask] = []
+    for _ in range(count):
+        proc
+ = rng.choice(PROCESS_IDS)
+        target_date = hot_date if rng.random() < conflict_bias else rng.choice(DEMO_DATES)
+        is_auto = rng.random() < 0.25
+        trigger = "AUTO" if is_auto else "MANUAL"
+        user = "scheduler_bot" if is_auto else rng
+.choice(users)
+        prio = 1 if is_auto else rng.choice((2, 2, 3))
+        delay = round(rng.uniform(0.0, 0.25), 3)
+        batch.append(ScenarioTask(proc, target_date, trigger, prio, delay, user))
+    return batch
+def main() -> None:
+    parser = arg
+parse.ArgumentParser(description="Генерация демо-сценариев и стресс-батча.")
+    parser.add_argument("--out", type=Path, default=Path("synthetic_data/scenarios.json"))
+    parser.add_argument("--random-count", type=int, default=15)
+    parser.add_argument(
+"--conflict-bias", type=float, default=0.65)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    payload = {
+        "scenarios": [asdict(s) for s in build_demo_scenarios()],
+        "random_stress_batch": [asdict(t)
+ for t in generate_random_batch(args.random_count, args.seed, args.conflict_bias)],
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Сценар
+ии сохранены в {args.out} ({args.out.stat().st_size} байт)")
+if __name__ == "__main__":
+    main()
+Полная карта базы данных
+Чтобы локальная база данных data/orchestrator.db покрывала не только журнал запусков, 
+но и декларативные ресурсные контракты, мно
+гопользовательские сессии, аудит блокировок, сравнение прогонов «До/После» и опциональное хранение доменных витрин с контролем row_version, схема организована в 4 логических слоях: 
+15 нормализованных таблиц
+, 
+10 индексов
+ и 
+3 аналитических представления (VIE
+W)
+. Ссылочная целостность обеспечивается PRAGMA foreign_keys = ON, а конкурентное чтение во время записи — режимом PRAGMA journal_mode = WAL с таймаутом busy_timeout = 5000.
+Спецификация таблиц по слоям
+Слой 1: Справочники и ресурсные контракты (Metadata Layer)
+Таблица
+Первичный ключ и внешние ключи
+Ключевые атрибуты и ограничения
+Роль в системе
+processes
+PK: process_id (TEXT)
+display_name, allow_parallel_dates (0/1), uses_shared_staging (0/1), staging_key, default_priority (1–5), timeout_sec (>0), estimated_duration_s, is_active
+Паспорт каждого риск-микросервиса; источник параметров для ProcessSpec и TTL блокировок
+data_sources
+PK: source_id (TEXT)
+display_name, table_or_file_name, granularity (DATE_PARTITIONED / GLOBAL_CUMULATIVE)
+Реестр 4 витрин данных с фиксацией их гранулярности
+process_source_rules
+PK: rule_id; FK: process_id → processes, source_id → data_sourc
+es
+access_mode (READ / WRITE / READ_WRITE), lock_scope (BY_DATE / GLOBAL), acquire_order (≥1), UNIQUE(process_id, source_id)
+Декларативная матрица доступов; используется RWLockManager для генерации ключей и сервисами для воспроизведения AB-BA порядка
+Слой
+ 2: Пользователи, клиентские сессии и расписание (Users & Schedules Layer)
+Таблица
+Первичный ключ и внешние ключи
+Ключевые атрибуты и ограничения
+Роль в системе
+users
+PK: user_id (TEXT)
+display_name, role (RISK_ANALYST, RISK_MANAGER, ADMIN, SYSTEM_SCHEDULER), 
+max_concurrent_tasks (≥1)
+Ролевой справочник аналитиков, менеджеров и бота авторегламента (scheduler_bot)
+user_sessions
+PK: session_id; FK: user_id → users
+client_id (идентификатор клиента NiceGUI), connected_at, disconnected_at, is_active (0/1)
+Учёт активных клиентских вкладок для аудита многопользовательской работы
+reglament_schedules
+PK: schedule_id; FK: process_id → processes
+interval_sec (≥1,0), target_
+date_offset (0 = сегодня, −1 = вчера), priority (1–5), is_enabled (0/1), last_triggered_at, next_trigger_at
+Настройка регламентного планировщика, доступная для управления из UI
+Слой 3: Операционный контур оркестрации (Runtime & Audit Layer)
+Таблица
+Первичный ключ и внешние ключи
+Ключевые атрибуты и ограничения
+Роль в системе
+simulation_runs
+PK: run_id (AUTOINCREMENT)
+scenario_id, orchestration_enabled (0/1), total_tasks, completed_tasks, failed_tasks, cancelled_tasks, deadlock_count, data_corruption
+_count, cross_date_collisions, avg_wait_sec, max_wait_sec, total_makespan_sec
+Агрегатная шапка каждого прогона сценария для мгновенного сравнения «До/После»
+task_runs
+PK: task_id; FK: run_id → simulation_runs, process_id → processes, initiated_by → users, session_id → user_sessions
+target_date, trigger_type (AUTO/MANUAL), idempotency_key, priority, effective_priority, status (6 статусов), progress (0–100), queued_at, st
+arted_at, finished_at, wait_duration_ms, exec_duration_ms, blocked_by, error_type, error_message, result_json
+Центральная таблица жизненного цикла всех задач; питает 3 колонки дашборда и диаграмму Ганта
+lock_audit
+PK: lock_event_id; FK: run_id → 
+simulatio
+n_runs, task_id → task_runs (CASCADE)
+lock_key, lock_mode (SHARED/EXCLUSIVE
+), resource_type (SOURCE_DATE/SOURCE_GLOBAL/PROCESS_STAGING), action (ACQUIRED/WAIT_CONFLICT/RELEASED/EXPIRED_TTL), blocking_task_ids (JSON), occurred_at, hold_duration_ms
+Пошаговый аудит решений 
+RWLockManager, объясняющий каждую блокировку и время ожидания
+orchestrator_events
+PK: event_id; FK: run_id → simulation_runs, task_id → task_runs, user_id → users
+timestamp, level (DEBUG/INFO/WARN/ERROR), event_code, message, payload_json
+Лента живого журнала событий в интерфейсе
+Слой 4: Доменные витрины и staging-буфер (Domain Data Layer)
+Для простоты MVP воркеры могут загружать начальные данные из synthetic_data/
+*.csv в SharedDataLayer в памяти, однако наличие зеркальных таблиц dom_* в orchestrator.db позволяет проверять целостность результатов прямыми SQL-запросами и сбрасывать состояние стенда транзакционно.
+Таблица
+Первичный / уникальный ключ
+Поля контроля качества и версионности
+Какие процессы читают / пишут
+dom_warehouse_stocks
+PK: record_id; UNIQUE(business_date, warehouse_id, sku_id)
+stockout_risk_flag, spoilage_risk_flag, row_version, updated_by_task_id
+WRITE: StockoutRisk, SpoilageRisk; 
+READ: DelayRisk
+dom_transit_telemetry
+PK: (business_date, shipment_id)
+gps_status, delay_risk_score, row_version, updated_by_task_id
+WRITE: DelayRisk; READ: StockoutRisk, CarrierDefaultRisk
+dom_weather_traffic
+PK: (business_date, corridor_id)
+weather_severity (0,0–1,0), traffic_congestion (0,0–1,0), road_alert_code
+READ-only справочник: DelayRisk, SpoilageRisk, CarrierDefaultRisk
+dom_supplier_sla
+PK: carrier_id (глобальный ключ без даты)
+as_of_date, on_time_rate, claim_rate, default_risk_score, sla_tier, row_version, updated_by_task_id
+WRITE (GLOBAL): CarrierDefaultRisk; READ (GLOBAL): StockoutRisk, DelayRisk
+dom_sla_staging_buffer
+PK: staging_row_id
+owner_task_id, business_date, carrier_
+id, metric_value, 
+loaded_at
+Промежуточный буфер CarrierDefaultRisk (детектор коллизий 
+при owner_task_id != current_task_id)
+Индексы, представления (VIEW) и критичная деталь инициализации SQLite
+Среди 10 индексов схемы ключевыми являются составной индекс очереди idx_task_runs_status_prio(status, effective_priority, queued_at) и 
+частичный индекс идемпотентности
+ idx_task_runs_idemp ON task_runs(idempotency_key) WHERE status IN ('QUEUED', 'RUNNING'),
+ ускоряющий поиск активных дублей. Три SQL-представления выносят типовые аналитические запросы из Python-кода: v_gantt_timeline подготавливает данные для диаграммы Ганта, v_before_after_comparison рассчитывает долю ошибок и среднее время ожидания по каждом
+у прогону, а v_conflict_matrix динамически выводит все 24 ресурсных пересечения из таблицы правил.
+Важный технический нюанс sqlite3 в Python:
+ как отмечается в обсуждениях разработчиков Python, при открытии соединения с autocommit=False транзакция открывает
+ся автоматически, а внутри активной транзакции команда PRAGMA foreign_keys = ON 
+молча игнорируется SQLite без ошибки
+. Для гарантированного включения внешних ключей соединение следует открывать с isolation_level=None, последовательно выполнять PRAGMA (journ
+al_mode = WAL, synchronous = NORMAL, busy_timeout = 5000, foreign_keys = ON), повторно подтверждать PRAGMA foreign_keys = ON после executescript() и управлять транзакциями явно через BEGIN/COMMIT.
+Полный верифицированный SQL DDL (core/schema.sql)
+PRAGMA jo
+urnal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA foreign_keys = ON;
+-- 1. СЛОЙ МЕТАДАННЫХ И КОНТРАКТОВ
+CREATE TABLE IF NOT EXISTS processes (
+    process_id           TEXT PRIMARY KEY,
+    display_name         TEXT NOT NUL
+L,
+    description          TEXT NOT NULL DEFAULT '',
+    allow_parallel_dates INTEGER NOT NULL DEFAULT 0 CHECK (allow_parallel_dates IN (0, 1)),
+    uses_shared_staging  INTEGER NOT NULL DEFAULT 0 CHECK (uses_shared_staging IN (0, 1)),
+    staging_key    
+      TEXT,
+    default_priority     INTEGER NOT NULL DEFAULT 2 CHECK (default_priority BETWEEN 1 AND 5),
+    timeout_sec          REAL NOT NULL DEFAULT 30.0 CHECK (timeout_sec > 0),
+    estimated_duration_s REAL NOT NULL DEFAULT 4.0 CHECK (estimated_durat
+ion_s > 0),
+    is_active            INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE TABLE IF NOT EXISTS data_sources (
+    source_id            TEXT 
+PRIMARY KEY,
+    display_name         TEXT NOT NULL,
+    table_or_file_name   TEXT NOT NULL,
+    granularity          TEXT NOT NULL CHECK (granularity IN ('DATE_PARTITIONED', 'GLOBAL_CUMULATIVE')),
+    description          TEXT NOT NULL DEFAULT ''
+);
+CREA
+TE TABLE IF NOT EXISTS process_source_rules (
+    rule_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    process_id           TEXT NOT NULL REFERENCES processes(process_id) ON DELETE CASCADE,
+    source_id            TEXT NOT NULL REFERENCES data_sour
+ces(source_id) ON DELETE CASCADE,
+    access_mode          TEXT NOT NULL CHECK (access_mode IN ('READ', 'WRITE', 'READ_WRITE')),
+    lock_scope           TEXT NOT NULL CHECK (lock_scope IN ('BY_DATE', 'GLOBAL')),
+    acquire_order        INTEGER NOT NULL D
+EFAULT 1 CHECK (acquire_order >= 1),
+    UNIQUE (process_id, source_id)
+);
+-- 2. СЛОЙ ПОЛЬЗОВАТЕЛЕЙ, СЕССИЙ И РЕГЛАМЕНТА
+CREATE TABLE IF NOT EXISTS users (
+    user_id              TEXT PRIMARY KEY,
+    display_name         TEXT NOT NULL,
+    role        
+         TEXT NOT NULL CHECK (role IN ('RISK_ANALYST', 'RISK_MANAGER', 'ADMIN', 'SYSTEM_SCHEDULER')),
+    max_concurrent_tasks INTEGER NOT NULL DEFAULT 5 CHECK (max_concurrent_tasks >= 1),
+    created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT
+%H:%M:%fZ', 'now'))
+);
+CREATE TABLE IF NOT EXISTS user_sessions (
+    session_id           TEXT PRIMARY KEY,
+    user_id              TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    client_id            TEXT NOT NULL,
+    connected_at      
+   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    disconnected_at      TEXT,
+    is_active            INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
+);
+CREATE TABLE IF NOT EXISTS reglament_schedules (
+    schedule_id          I
+NTEGER PRIMARY KEY AUTOINCREMENT,
+    process_id           TEXT NOT NULL REFERENCES processes(process_id) ON DELETE CASCADE,
+    interval_sec         REAL NOT NULL DEFAULT 15.0 CHECK (interval_sec >= 1.0),
+    target_date_offset   INTEGER NOT NULL DEFAULT 
+0,
+    priority             INTEGER NOT NULL DEFAULT 1 CHECK (priority BETWEEN 1 AND 5),
+    is_enabled           INTEGER NOT NULL DEFAULT 0 CHECK (is_enabled IN (0, 1)),
+    last_triggered_at    TEXT,
+    next_trigger_at      TEXT
+);
+-- 3. ОПЕРАЦИОННЫЙ С
+ЛОЙ ОРКЕСТРАЦИИ
+CREATE TABLE IF NOT EXISTS simulation_runs (
+    run_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    scenario_id           TEXT,
+    scenario_title        TEXT,
+    orchestration_enabled INTEGER NOT NULL CHECK (orchestration_enable
+d IN (0, 1)),
+    started_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    finished_at           TEXT,
+    total_tasks           INTEGER NOT NULL DEFAULT 0,
+    completed_tasks       INTEGER NOT NULL DEFAULT 0,
+    failed_ta
+sks          INTEGER NOT NULL DEFAULT 0,
+    cancelled_tasks       INTEGER NOT NULL DEFAULT 0,
+    deadlock_count        INTEGER NOT NULL DEFAULT 0,
+    data_corruption_count INTEGER NOT NULL DEFAULT 0,
+    cross_date_collisions INTEGER NOT NULL DEFAULT 0,
+    avg_wait_sec          REAL NOT NULL DEFAULT 0.0,
+    max_wait_sec          REAL NOT NULL DEFAULT 0.0,
+    total_makespan_sec    REAL NOT NULL DEFAULT 0.0,
+    notes                 TEXT
+);
+CREATE TABLE IF NOT EXISTS task_runs (
+    task_id           
+    INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                INTEGER REFERENCES simulation_runs(run_id) ON DELETE SET NULL,
+    process_id            TEXT NOT NULL REFERENCES processes(process_id),
+    target_date           TEXT NOT NULL,
+    trigger_t
+ype          TEXT NOT NULL CHECK (trigger_type IN ('AUTO', 'MANUAL')),
+    initiated_by          TEXT NOT NULL DEFAULT 'analyst_1' REFERENCES users(user_id),
+    session_id            TEXT REFERENCES user_sessions(session_id) ON DELETE SET NULL,
+    idempo
+tency_key       TEXT,
+    priority              INTEGER NOT NULL CHECK (priority BETWEEN 1 AND 5),
+    effective_priority    REAL NOT NULL,
+    status                TEXT NOT NULL CHECK (status IN ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', '
+DEDUPLICATED')),
+    progress              INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
+    orchestration_enabled INTEGER NOT NULL DEFAULT 1 CHECK (orchestration_enabled IN (0, 1)),
+    queued_at             TEXT NOT NULL,
+    started_at 
+           TEXT,
+    finished_at           TEXT,
+    wait_duration_ms      INTEGER,
+    exec_duration_ms      INTEGER,
+    blocked_by            TEXT,
+    error_type            TEXT CHECK (error_type IN (NULL, 'DeadlockError', 'DataCorruptionError', 'Cross
+DateCollisionError', 'TimeoutError', 'CancelledError', 'RuntimeError')),
+    error_message         TEXT,
+    result_json           TEXT
+);
+CREATE TABLE IF NOT EXISTS lock_audit (
+    lock_event_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id     
+           INTEGER REFERENCES simulation_runs(run_id) ON DELETE SET NULL,
+    task_id               INTEGER NOT NULL REFERENCES task_runs(task_id) ON DELETE CASCADE,
+    lock_key              TEXT NOT NULL,
+    lock_mode             TEXT NOT NULL CHECK (lo
+ck_mode IN ('SHARED', 'EXCLUSIVE')),
+    resource_type         TEXT NOT NULL CHECK (resource_type IN ('SOURCE_DATE', 'SOURCE_GLOBAL', 'PROCESS_STAGING')),
+    action                TEXT NOT NULL CHECK (action IN ('ACQUIRED', 'WAIT_CONFLICT', 'RELEASED', 'E
+XPIRED_TTL')),
+    blocking_task_ids     TEXT,
+    occurred_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    hold_duration_ms      INTEGER
+);
+CREATE TABLE IF NOT EXISTS orchestrator_events (
+    event_id              INTEGER
+ PRIMARY KEY AUTOINCREMENT,
+    run_id                INTEGER REFERENCES simulation_runs(run_id) ON DELETE SET NULL,
+    timestamp             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    level                 TEXT NOT NULL CHECK (lev
+el IN ('DEBUG', 'INFO', 'WARN', 'ERROR')),
+    event_code            TEXT NOT NULL DEFAULT 'GENERAL',
+    task_id               INTEGER REFERENCES task_runs(task_id) ON DELETE SET NULL,
+    user_id               TEXT REFERENCES users(user_id) ON DELETE SET
+ NULL,
+    message               TEXT NOT NULL,
+    payload_json          TEXT
+);
+-- 4. ДОМЕННЫЙ СЛОЙ (ВИТРИНЫ И STAGING-БУФЕР)
+CREATE TABLE IF NOT EXISTS dom_warehouse_stocks (
+    record_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_dat
+e         TEXT NOT NULL,
+    warehouse_id          TEXT NOT NULL,
+    sku_id                TEXT NOT NULL,
+    sku_category          TEXT NOT NULL,
+    qty_on_hand           INTEGER NOT NULL CHECK (qty_on_hand >= 0),
+    qty_reserved          INTEGER NOT N
+ULL DEFAULT 0,
+    reorder_point         INTEGER NOT NULL,
+    avg_daily_demand      REAL NOT NULL,
+    expiry_date           TEXT,
+    temp_celsius          REAL,
+    stockout_risk_flag    INTEGER NOT NULL DEFAULT 0,
+    spoilage_risk_flag    INTEGER NOT 
+NULL DEFAULT 0,
+    row_version           INTEGER NOT NULL DEFAULT 1,
+    updated_by_task_id    INTEGER,
+    UNIQUE (business_date, warehouse_id, sku_id)
+);
+CREATE TABLE IF NOT EXISTS dom_transit_telemetry (
+    shipment_id           TEXT NOT NULL,
+    bu
+siness_date         TEXT NOT NULL,
+    carrier_id            TEXT NOT NULL,
+    warehouse_id          TEXT NOT NULL,
+    sku_id                TEXT NOT NULL,
+    corridor_id           TEXT NOT NULL,
+    planned_eta_hours     REAL NOT NULL,
+    actual_eta_h
+ours      REAL NOT NULL,
+    cargo_qty             INTEGER NOT NULL,
+    cargo_temp_celsius    REAL,
+    gps_status            TEXT NOT NULL CHECK (gps_status IN ('ON_TIME', 'DELAYED', 'STOPPED', 'REROUTED')),
+    delay_risk_score      REAL NOT NULL DEFAUL
+T 0.0,
+    row_version           INTEGER NOT NULL DEFAULT 1,
+    updated_by_task_id    INTEGER,
+    PRIMARY KEY (business_date, shipment_id)
+);
+CREATE TABLE IF NOT EXISTS dom_weather_traffic (
+    business_date         TEXT NOT NULL,
+    corridor_id      
+     TEXT NOT NULL,
+    region_name           TEXT NOT NULL,
+    weather_severity      REAL NOT NULL CHECK (weather_severity BETWEEN 0.0 AND 1.0),
+    temp_ambient_celsius  REAL NOT NULL,
+    traffic_congestion    REAL NOT NULL CHECK (traffic_congestion BE
+TWEEN 0.0 AND 1.0),
+    road_alert_code       TEXT NOT NULL DEFAULT 'NONE',
+    PRIMARY KEY (business_date, corridor_id)
+);
+CREATE TABLE IF NOT EXISTS dom_supplier_sla (
+    carrier_id            TEXT PRIMARY KEY,
+    carrier_name          TEXT NOT NULL,
+    as_of_date            TEXT NOT NULL,
+    rolling_window_days   INTEGER NOT NULL DEFAULT 30,
+    on_time_rate          REAL NOT NULL CHECK (on_time_rate BETWEEN 0.0 AND 1.0),
+    claim_rate            REAL NOT NULL CHECK (claim_rate BETWEEN 0.0 AND 1.0)
+,
+    active_shipments      INTEGER NOT NULL DEFAULT 0,
+    default_risk_score    REAL NOT NULL DEFAULT 0.0,
+    sla_tier              TEXT NOT NULL CHECK (sla_tier IN ('A', 'B', 'C', 'CRITICAL')),
+    row_version           INTEGER NOT NULL DEFAULT 1,
+    
+updated_by_task_id    INTEGER
+);
+CREATE TABLE IF NOT EXISTS dom_sla_staging_buffer (
+    staging_row_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_task_id         INTEGER NOT NULL,
+    business_date         TEXT NOT NULL,
+    carrier_id          
+  TEXT NOT NULL,
+    metric_value          REAL NOT NULL,
+    loaded_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+-- 5. ИНДЕКСЫ
+CREATE INDEX IF NOT EXISTS idx_task_runs_status_prio ON task_runs(status, effective_priority
+, queued_at);
+CREATE INDEX IF NOT EXISTS idx_task_runs_run_id      ON task_runs(run_id, queued_at);
+CREATE INDEX IF NOT EXISTS idx_task_runs_proc_date   ON task_runs(process_id, target_date, status);
+CREATE INDEX IF NOT EXISTS idx_task_runs_idemp       ON 
+task_runs(idempotency_key) WHERE status IN ('QUEUED', 'RUNNING');
+CREATE INDEX IF NOT EXISTS idx_lock_audit_task       ON lock_audit(task_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_lock_audit_key        ON lock_audit(lock_key, action, occurred_at);
+C
+REATE INDEX IF NOT EXISTS idx_events_run_ts         ON orchestrator_events(run_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_events_task           ON orchestrator_events(task_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_dom_stocks_date_wh    O
+N dom_warehouse_stocks(business_date, warehouse_id);
+CREATE INDEX IF NOT EXISTS idx_dom_transit_date_carr ON dom_transit_telemetry(business_date, carrier_id);
+-- 6. АНАЛИТИЧЕСКИЕ ПРЕДСТАВЛЕНИЯ (VIEWS)
+CREATE VIEW IF NOT EXISTS v_gantt_timeline AS
+SELECT
+ 
+   t.task_id, t.run_id, t.process_id, p.display_name AS process_name,
+    t.target_date, t.trigger_type, t.initiated_by, t.status, t.priority,
+    t.queued_at, t.started_at, t.finished_at, t.wait_duration_ms,
+    t.exec_duration_ms, t.blocked_by, t.error_t
+ype
+FROM task_runs t
+JOIN processes p ON p.process_id = t.process_id
+ORDER BY t.queued_at ASC, t.task_id ASC;
+CREATE VIEW IF NOT EXISTS v_before_after_comparison AS
+SELECT
+    run_id, scenario_id,
+    CASE orchestration_enabled WHEN 1 THEN 'WITH_ORCHESTRA
+TOR' ELSE 'WITHOUT_ORCHESTRATOR' END AS mode,
+    total_tasks, completed_tasks, failed_tasks,
+    ROUND(100.0 * failed_tasks / NULLIF(total_tasks, 0), 1) AS error_rate_pct,
+    deadlock_count, data_corruption_count, cross_date_collisions,
+    ROUND(avg_wai
+t_sec, 2) AS avg_wait_sec,
+    ROUND(total_makespan_sec, 2) AS total_makespan_sec
+FROM simulation_runs
+ORDER BY run_id DESC;
+CREATE VIEW IF NOT EXISTS v_conflict_matrix AS
+SELECT
+    r1.process_id AS process_a,
+    r2.process_id AS process_b,
+    r1.sourc
+e_id  AS shared_source,
+    r1.access_mode AS mode_a,
+    r2.access_mode AS mode_b,
+    CASE
+        WHEN r1.access_mode = 'READ' AND r2.access_mode = 'READ' THEN 'COMPATIBLE_PARALLEL'
+        WHEN r1.lock_scope = 'GLOBAL' OR r2.lock_scope = 'GLOBAL' THEN 
+'CONFLICT_GLOBAL_ALL_DATES'
+        ELSE 'CONFLICT_SAME_DATE'
+    END AS conflict_type
+FROM process_source_rules r1
+JOIN process_source_rules r2
+  ON r1.source_id = r2.source_id
+ AND r1.process_id <= r2.process_id;
+Упрощение и оптимизация стека разработки
+Выбранная в ТЗ монолитная Python-архитектура на базе NiceGUI + asyncio + SQLite уже хорошо подходит для сжатых сроков: отказ от отдельного React-фронтенда, Redis и Docker Compose экономит время на стыковке, а отказ от Streamlit технически оправдан его мод
+елью полного перезапуска скрипта при каждом изменении и сложностями совмещения многопоточного Tornado с фоновыми asyncio-циклами. Тем не менее этот стек содержит два избыточных звена и несколько рисков перед защитой, которые устраняются пятью точечными опт
+имизациями.
+Пять конкретных оптимизаций стека
+1. Заменить plotly на встроенный ui.echart (Apache ECharts)
+В исходном ТЗ plotly>=5.24.0 подключается исключительно ради одного графика — диаграммы Ганта. По метаданным PyPI на осень 2026 года, wheel-файл plotly 7.1.0 (релиз от 15 сентября 2026 года) весит 
+9,7 МБ
+, а типичная библиотека совместимости с датафреймами 
+narwhals 2.29.0 (релиз от 17 ноября 2026 года) добавляет ещё 501,7 КБ (~0,5 МБ) (отметим, что полный список транзитивных зависимостей plotly 7.1.0 в собранных метаданных PyPI не детализирован, поэтому оценка с narwhals носит ориентировочный характер). При 
+этом сам nicegui (wheel 8,2 МБ на 4 ноября 2026 года) уже включает Apache ECharts из коробки через нативный виджет ui.echart, который принимает обычный Python-словарь options и пушит обновления по WebSocket.
+Чтобы не писать JavaScript-обработчики (:renderI
+tem и т. п.), для диаграммы Ганта в ECharts используется приём 
+Stacked Bar с прозрачным базовым слоем
+ (аналог waterfall-диаграмм в ECharts): прозрачная серия offset отсчитывает время до постановки в очередь, жёлтая серия отображает ожидание (started_at - q
+ueued_at), а цветная серия — выполнение задачи (finished_at - started_at). Сформированный JSON-словарь для 3 задач занимает всего 
+1 007 байт
+. Готовый генератор для ui/components/gantt_chart.py:
+def build_echarts_gantt_options(tasks: list[dict], t0_epoch: float, now_epoch: float) -> dict:
+    """Чистый Python-словарь для nicegui.ui.echart(...) без Plotly и без JS."""
+    status_colors = {
+        "RUNNING": "#1A73E8",
+        "COMPLETED": "#22C55E
+",
+        "FAILED": "#D93025",
+        "CANCELLED": "#94A3B8",
+        "QUEUED": "#FCC934",
+        "DEDUPLICATED": "#C58AF9",
+    }
+    labels, offset_data, wait_data, exec_data = [], [], [], []
+    for t in tasks:
+        labels.append(f"#{t['task_id']}
+ {t['process_id']} ({t['target_date'][-5:]})")
+        q_rel = round(max(0.0, t["queued_at"] - t0_epoch), 2)
+        s_rel = round(max(q_rel, (t["started_at"] or now_epoch) - t0_epoch), 2)
+        f_rel = round(max(s_rel, (t["finished_at"] or now_epoch) - 
+t0_epoch), 2)
+        offset_data.append(q_rel)
+        wait_data.append(round(s_rel - q_rel, 2))
+        exec_dur = round(f_rel - s_rel, 2) if t["started_at"] is not None else 0.0
+        exec_data.append({
+            "value": exec_dur,
+            "item
+Style": {"color": status_colors.get(t["status"], "#64748B"), "borderRadius": 4},
+        })
+    return {
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+        "legend": {"data": ["Ожидание в очереди (с)", "Выполнение (с)"], "b
+ottom": 0},
+        "grid": {"left": "26%", "right": "5%", "top": "8%", "bottom": "14%"},
+        "xAxis": {"type": "value", "name": "Время (сек)"},
+        "yAxis": {"type": "category", "inverse": True, "data": labels},
+        "series": [
+            {
+ 
+               "name": "Смещение",
+                "type": "bar",
+                "stack": "gantt",
+                "silent": True,
+                "itemStyle": {"color": "transparent"},
+                "tooltip": {"show": False},
+                "data": o
+ffset_data,
+            },
+            {
+                "name": "Ожидание в очереди (с)",
+                "type": "bar",
+                "stack": "gantt",
+                "itemStyle": {"color": "#FCC934", "borderRadius": 3},
+                "data": wait_d
+ata,
+            },
+            {"name": "Выполнение (с)", "type": "bar", "stack": "gantt", "data": exec_data},
+        ],
+    }
+2. Заменить aiosqlite на встроенный sqlite3 (одно WAL-соединение)
+Как отмечается в инженерных разборах и документации библиоте
+к, aiosqlite не реализует нативный асинхронный I/O на уровне ОС: он открывает соединение в отдельном рабочем потоке и передаёт запросы через Future, при этом сам движок SQLite всё равно допускает 
+строго одного писателя одновременно. Дополнительный практиче
+ский риск на демо — известная проблема зависания рабочего потока aiosqlite при завершении приложения или Ctrl+C (в частности, в заметках к релизам Apache Airflow описан отдельный фикс защиты от зависающего потока в aiosqlite 0.22+, а сторонние обёртки выну
+ждены принудительно демонизировать его поток).
+Локальный синтетический микробенчмарк стандартного sqlite3 (SQLite 3.46.1) с одним постоянным соединением в режиме WAL + synchronous = NORMAL (500 операций) показал среднее время одиночного INSERT 
+0,097 мс
+ и в
+ыборки 50 строк из v_gantt_timeline 
+0,181 мс
+. При характерной нагрузке MVP (порядка 10–30 записей в секунду на пике стресс-сценария) суммарная задержка в цикле событий не превышает нескольких миллисекунд, что на порядки ниже стандартного 3-секундного тайма
+ута сборки страницы в NiceGUI. Важная оговорка для масштабирования: синхронный вызов оправдан именно для локального SQLite при небольших таблицах MVP; при переходе на сетевой PostgreSQL или росте базы до сотен тысяч строк класс Storage следует перевести на
+ асинхронный драйвер либо выносить тяжёлые запросы через asyncio.to_thread().
+3. Обезопасить многопользовательский UI через nicegui.Event и браузерный режим
+Поскольку NiceGUI выполняется в одном процессе Python, переменные уровня модуля разделяются между в
+семи подключёнными пользователями, а функция @ui.page('/') запускается заново для каждой новой вкладки. Чтобы исключить утечку ссылок при закрытии вкладок, вместо ручного списка коллбэков в Orchestrator стоит либо использовать встроенный класс nicegui.Even
+t() (чей метод subscribe() автоматически регистрирует отписку через client.on_delete), либо явно привязывать ui.context.client.on_delete(lambda: orchestrator.unsubscribe(cb)).
+Кроме того, для защиты проекта рекомендуется отказаться от ui.run(native=True) в
+ пользу обычного браузерного запуска (localhost:8080): по официальной документации NiceGUI, нативный режим опирается на pywebview и требует современного системного браузерного движка (.NET Framework + EdgeChromium на Windows, актуальный WebKitGTK/Qt на Lin
+ux), что создаёт лишнюю точку отказа на чужом ноутбуке. В браузерном режиме многопользовательский сценарий наглядно показывается в двух окнах рядом (analyst_1 и analyst_2), а при необходимости быстрого удалённого показа доступен встроенный техпревью-туннел
+ь ui.run(on_air=True) (исключительно для временного демо, не для production).
+4. Зафиксировать ветку NiceGUI 3.x и перевести команду на uv
+В исходном ТЗ указано nicegui>=2.0.0, но к ноябрю 2026 года актуальна ветка 
+NiceGUI 3.x
+: на PyPI пакет от 4 ноября 20
+26 года требует Python >=3.11,<4, а в техническом обзоре линейки 3.x (версия 3.18.0 от октября 2026 года) отдельно подчёркивается наличие критических исправлений безопасности 2025–2026 годов (XSS в ui.markdown и run_method(), path traversal в FileUpload.na
+me) и несовместимых изменений относительно 2.x.
+Замена связки venv + pip + requirements.txt на менеджер пакетов uv с едиными файлами pyproject.toml, .python-version и uv.lock гарантирует идентичную версию Python и зависимостей у всех пяти участников команд
+ы. По замерам из инженерных обзоров экосистемы Python, uv разрешает и устанавливает зависимости кратно быстрее pip и Poetry (авторы обзоров приводят оценки ускорения от 10 до 100 раз при тёплом кэше и 
+сокращения онбординга с ~30 минут до ~2 минут). Для суд
+ей без uv в репозитории можно хранить автогенерируемый requirements.txt (uv export --no-hashes -o requirements.txt). Минимальный pyproject.toml проекта:
+[project]
+name = "risk-orchestrator"
+version = "0.1.0"
+description = "Оркестратор параллельных процессо
+в оценки логистических рисков"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "nicegui>=3.18.0,<4.0.0",
+]
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff>=0.8.0",
+]
+5. Упростить структуру репозитория и автоинициализацию
+В структуре проекта нужн
+о удалить дублирующуюся строку .gitignore, добавить каталог scripts/ (для трёх генераторов данных) и файл core/schema.sql. Если в main.py при старте проверять наличие synthetic_data/*.csv и data/orchestrator.db (и при их отсутствии автоматически запускать 
+генерацию витрин и инициализацию схемы SQLite), то чистый клон репозитория будет запускаться с нуля ровно одной командой uv run main.py.
+Итоговое сравнение стека: «Было в ТЗ» vs «Оптимизированный стек»
+Компонент
+Исходное ТЗ
+Оптимизированный стек
+Практический выигрыш для команды
+Прямые PyPI-зависимости (runtime)
+3 (nicegui>=2.0, plotly>=5.24, aiosqlite>=0.20)
+1 (nicegui>=3.18.0,<4.0.0)
+Исключено ≥9,7 МБ wheel-артефакта plotly (и до ~10,2 МБ с narwhals); минимизирован риск конфликта версий
+Диаграмма Ганта
+Plotly (ui.plotly)
+Встроенный Apache ECharts (ui.echart Stacked Bar)
+Передача ~1 КБ JSON по WebSocket без сборки тяжёлого go.Figure и без JavaScript
+Хранилище SQLite
+aiosqlite (выделенный фоновый поток)
+Стандартный sqlite3 (одно WAL-соедин
+ение, isolation_level=None)
+Локальный замер 0,097–0,181 мс; устранены риски зависания фонового потока при выходе
+Синтетические 
+данные и логи
+Не формализованы
+3 скрипта в scripts/ на 
+чистой stdlib (seed=42)
+Воспроизводимые 
+витрины (316 строк), логи (86 событий) и сценарии без pandas/fa[span_16](start_span)[span_16](end_span)[span_18](start_span)[span_18](end_span)ker
+Многопользовательский UI
+Кастомный subscribe(), опция native=True
+@ui.page('/') + nicegui.Event / client.on_delete(), браузерный режим
+Защита от утечек подписок, наглядное многовкладочное демо без зависимостей pywebview
+Управление средой
+venv + pip install -r requirements.txt
+uv (pyproject.toml + uv.lock + .python-versi
+on)
+Запуск чистого стенда одной командой uv run main.py с гарантированно одинаковой средой у всех 5 участников
+Внедрение восьми доработок ТЗ, запуск трёх автономных генераторов данных, нормализованная 4-слойная база данных и переход на однопакетный стек NiceGUI 3.x + ECharts + sqlite3 WAL позволяют команде не тратить время на инфраструктурную отладку и сосредоточит
+ься на главных критериях жюри — доказательной логике гранулярных блокировок, проверяемой целостности данных и безотказном многопользовательском демо.
+Источники
+1. Episode #525 - NiceGUI Goes 3.0 | Talk Python To Me Podcast, https://talkpython.fm/episodes/s
+how/525/nicegui-goes-3.0 2. uv for Non-Python Teams | pydevtools, https://pydevtools.com/handbook/explanation/uv-for-non-python-teams/ 3. SQLite: enable WAL mode and busy_timeout for concurrent write, https://github.com/cashubtc/nutshell/issues/907 4. Fore
+ign key constraints in SQLite - Python Discussions, https://discuss.python.org/t/foreign-key-constraints-in-sqlite/109058 5. Python NiceGUI: Build Powerful Web Interfaces with Ease - DataCamp, https://www.datacamp.com/tutorial/nicegui 6. Streamlit, asyncio
+ and MongoDB - Handmade Software - Medium, https://handmadesoftware.medium.com/streamlit-asyncio-and-mongodb-f85f77aea825 7. plotly - PyPI, https://pypi.org/project/plotly/ 8. narwhals - PyPI, https://pypi.org/project/narwhals/ 9. nicegui - PyPI, https://p
+ypi.org/project/nicegui/ 10. Data Elements | NiceGUI, https://nicegui.io/documentation/section_data_elements 11. Ask Your Database Anything: Native React Dashboards, https://dotzlaw.com/projects/txttosql-native-charts/ 12. SQLite async connection pool for 
+high-performance - Hacker News, https://news.ycombinator.com/item?id=44530518 13. aiosqlitepool - SQLite async connection pool for high-performance, https://www.reddit.com/r/Python/comments/1lx3njh/aiosqlitepool_sqlite_async_connection_pool_for/ 14. This i
+s strange on so many levels. SQLite does not even do network, 
+https://news.ycombinator.com/item?id=44565326 15. Relational Databases - Cognee Documentation, https://docs.cognee.ai/setup-configuration/relational-databases 16. Release Notes — Airflow 3.4.0 D
+ocumentation, https://airflow.apache.org/docs/apache-airflow/stable/release_notes.html 17. GitHub - MihanEntalpo/ScriptDB: Simple sqlite database wrapper for, https://github.com/MihanEntalpo/ScriptDB 18. Feeding data generated via asyncio into a synchronou
+s main loop, https://discuss.python.org/t/feeding-data-generated-via-asyncio-into-a-synchronous-main-loop/5436 19. llms.md - zauberzeug/nicegui - GitHub, https://github.com/zauberzeug/nicegui/blob/main/nicegui/llms.md 20. Async and Concurrency Architecture
+: Fixing AI's Synchronous, http://wfcoding.com/en/articles/design/0115/ 21. Async Support — peewee 4.5.3 documentation, https://docs.peewee-orm.com/en/latest/peewee/asyncio.html 22. Awaiting ui.Event leaks its task when the client is deleted · Issue, https
+://github.com/zauberzeug/nicegui/issues/6311 23. NiceGUI Documentation, https://nicegui.io/documentation 24. Page will refresh after a network offline and online #5409 - GitHub, https://github.com/zauberzeug/nicegui/issues/5409 25. Configuration & Deployme
+nt - NiceGUI, https://nicegui.io/documentation/section_configuration_deployment 26. NiceGUI Tutorial for Beginners: Python GUI in 5 Minutes - Bitdoze, https://www.bitdoze.com/nicegui-get-started/ 27. uv: The Python Tool That Should Have Existed Ten Years A
+go, https://medium.com/@simardeep.oberoi/uv-the-python-tool-that-should-have-existed-ten-years-ago-46ff611195ca 28. Ultimate guide to uv library in Python - Deepnote, https://deepnote.com/blog/ultimate-guide-to-uv-library-in-python-cmer41oac3i6e07k6c6o5ta4
+7 29. The Definitive Guide to UV: Python Packaging in Production.md, https://gist.github.com/luigiMinardi/a51617d70a4c6c89879b62fe5bd2e61b

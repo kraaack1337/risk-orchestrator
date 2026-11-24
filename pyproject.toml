@@ -1,0 +1,19 @@
+[project]
+name = "risk-orchestrator"
+version = "0.1.0"
+description = "Оркестратор оценки логистических рисков"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "nicegui>=3.18.0,<4.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
