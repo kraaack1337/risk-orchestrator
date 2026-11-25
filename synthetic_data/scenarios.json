@@ -1,0 +1,329 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "s1_manual_vs_reglament",
+      "title": "Сценарий 1: Ручной vs Регламент (Lost Update + Дубль)",
+      "description": "Ночной регламент StockoutRisk и одновременный ручной запуск SpoilageRisk + дубль StockoutRisk за 2026-11-20.",
+      "tasks": [
+        {
+          "process_id": "StockoutRisk",
+          "target_date": "2026-11-20",
+          "trigger": "AUTO",
+          "priority": 1,
+          "delay_sec": 0.0,
+          "initiated_by": "scheduler_bot"
+        },
+        {
+          "process_id": "SpoilageRisk",
+          "target_date": "2026-11-20",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.05,
+          "initiated_by": "analyst_1"
+        },
+        {
+          "process_id": "StockoutRisk",
+          "target_date": "2026-11-20",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.08,
+          "initiated_by": "analyst_2"
+        }
+      ]
+    },
+    {
+      "scenario_id": "s2_abba_deadlock",
+      "title": "Сценарий 2: Взаимная блокировка AB-BA (Deadlock)",
+      "description": "Одновременный запуск StockoutRisk и DelayRisk за 2026-11-20 с противоположным порядком захвата WarehouseStocks <-> TransitTelemetry.",
+      "tasks": [
+        {
+          "process_id": "StockoutRisk",
+          "target_date": "2026-11-20",
+          "trigger": "AUTO",
+          "priority": 1,
+          "delay_sec": 0.0,
+          "initiated_by": "scheduler_bot"
+        },
+        {
+          "process_id": "DelayRisk",
+          "target_date": "2026-11-20",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.02,
+          "initiated_by": "analyst_2"
+        }
+      ]
+    },
+    {
+      "scenario_id": "s3_cross_date_collision",
+      "title": "Сценарий 3: Перекрёстные даты и глобальный SLA",
+      "description": "Два пользователя запускают CarrierDefaultRisk за разные даты (общий staging) + DelayRisk читает глобальную витрину SupplierSLA.",
+      "tasks": [
+        {
+          "process_id": "CarrierDefaultRisk",
+          "target_date": "2026-11-19",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.0,
+          "initiated_by": "analyst_1"
+        },
+        {
+          "process_id": "CarrierDefaultRisk",
+          "target_date": "2026-11-20",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.04,
+          "initiated_by": "manager_1"
+        },
+        {
+          "process_id": "DelayRisk",
+          "target_date": "2026-11-21",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.06,
+          "initiated_by": "analyst_2"
+        }
+      ]
+    },
+    {
+      "scenario_id": "s4_parallel_safe",
+      "title": "Сценарий 4: Безопасный параллелизм (разные даты и READ+READ)",
+      "description": "Независимые процессы и партиционированные даты (SpoilageRisk 11-18, 11-19 + DelayRisk 11-22) стартуют строго одновременно.",
+      "tasks": [
+        {
+          "process_id": "SpoilageRisk",
+          "target_date": "2026-11-18",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.0,
+          "initiated_by": "analyst_1"
+        },
+        {
+          "process_id": "SpoilageRisk",
+          "target_date": "2026-11-19",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.0,
+          "initiated_by": "analyst_2"
+        },
+        {
+          "process_id": "DelayRisk",
+          "target_date": "2026-11-22",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.0,
+          "initiated_by": "manager_1"
+        }
+      ]
+    },
+    {
+      "scenario_id": "s5_multiuser_storm",
+      "title": "Сценарий 5: Стресс-тест «Шторм пользователей» (10 задач)",
+      "description": "Регламент и 3 аналитика одновременно вбрасывают 10 задач: AB-BA, Lost Update, глобальный SLA, дубль и независимые даты.",
+      "tasks": [
+        {
+          "process_id": "StockoutRisk",
+          "target_date": "2026-11-20",
+          "trigger": "AUTO",
+          "priority": 1,
+          "delay_sec": 0.0,
+          "initiated_by": "scheduler_bot"
+        },
+        {
+          "process_id": "DelayRisk",
+          "target_date": "2026-11-20",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.02,
+          "initiated_by": "analyst_1"
+        },
+        {
+          "process_id": "SpoilageRisk",
+          "target_date": "2026-11-20",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.03,
+          "initiated_by": "analyst_2"
+        },
+        {
+          "process_id": "CarrierDefaultRisk",
+          "target_date": "2026-11-20",
+          "trigger": "AUTO",
+          "priority": 1,
+          "delay_sec": 0.05,
+          "initiated_by": "scheduler_bot"
+        },
+        {
+          "process_id": "CarrierDefaultRisk",
+          "target_date": "2026-11-19",
+          "trigger": "MANUAL",
+          "priority": 3,
+          "delay_sec": 0.06,
+          "initiated_by": "manager_1"
+        },
+        {
+          "process_id": "SpoilageRisk",
+          "target_date": "2026-11-18",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.07,
+          "initiated_by": "analyst_1"
+        },
+        {
+          "process_id": "DelayRisk",
+          "target_date": "2026-11-21",
+          "trigger": "MANUAL",
+          "priority": 3,
+          "delay_sec": 0.08,
+          "initiated_by": "analyst_2"
+        },
+        {
+          "process_id": "StockoutRisk",
+          "target_date": "2026-11-20",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.09,
+          "initiated_by": "analyst_1"
+        },
+        {
+          "process_id": "SpoilageRisk",
+          "target_date": "2026-11-22",
+          "trigger": "MANUAL",
+          "priority": 3,
+          "delay_sec": 0.1,
+          "initiated_by": "manager_1"
+        },
+        {
+          "process_id": "StockoutRisk",
+          "target_date": "2026-11-21",
+          "trigger": "MANUAL",
+          "priority": 2,
+          "delay_sec": 0.12,
+          "initiated_by": "analyst_2"
+        }
+      ]
+    }
+  ],
+  "random_stress_batch": [
+    {
+      "process_id": "StockoutRisk",
+      "target_date": "2026-11-20",
+      "trigger": "MANUAL",
+      "priority": 2,
+      "delay_sec": 0.184,
+      "initiated_by": "analyst_1"
+    },
+    {
+      "process_id": "StockoutRisk",
+      "target_date": "2026-11-20",
+      "trigger": "AUTO",
+      "priority": 1,
+      "delay_sec": 0.023,
+      "initiated_by": "scheduler_bot"
+    },
+    {
+      "process_id": "DelayRisk",
+      "target_date": "2026-11-20",
+      "trigger": "AUTO",
+      "priority": 1,
+      "delay_sec": 0.05,
+      "initiated_by": "scheduler_bot"
+    },
+    {
+      "process_id": "CarrierDefaultRisk",
+      "target_date": "2026-11-20",
+      "trigger": "MANUAL",
+      "priority": 2,
+      "delay_sec": 0.175,
+      "initiated_by": "analyst_1"
+    },
+    {
+      "process_id": "SpoilageRisk",
+      "target_date": "2026-11-20",
+      "trigger": "AUTO",
+      "priority": 1,
+      "delay_sec": 0.191,
+      "initiated_by": "scheduler_bot"
+    },
+    {
+      "process_id": "StockoutRisk",
+      "target_date": "2026-11-20",
+      "trigger": "AUTO",
+      "priority": 1,
+      "delay_sec": 0.212,
+      "initiated_by": "scheduler_bot"
+    },
+    {
+      "process_id": "SpoilageRisk",
+      "target_date": "2026-11-21",
+      "trigger": "MANUAL",
+      "priority": 2,
+      "delay_sec": 0.138,
+      "initiated_by": "analyst_2"
+    },
+    {
+      "process_id": "SpoilageRisk",
+      "target_date": "2026-11-20",
+      "trigger": "MANUAL",
+      "priority": 3,
+      "delay_sec": 0.057,
+      "initiated_by": "analyst_1"
+    },
+    {
+      "process_id": "SpoilageRisk",
+      "target_date": "2026-11-19",
+      "trigger": "MANUAL",
+      "priority": 2,
+      "delay_sec": 0.113,
+      "initiated_by": "analyst_2"
+    },
+    {
+      "process_id": "SpoilageRisk",
+      "target_date": "2026-11-20",
+      "trigger": "MANUAL",
+      "priority": 2,
+      "delay_sec": 0.175,
+      "initiated_by": "manager_1"
+    },
+    {
+      "process_id": "StockoutRisk",
+      "target_date": "2026-11-20",
+      "trigger": "AUTO",
+      "priority": 1,
+      "delay_sec": 0.182,
+      "initiated_by": "scheduler_bot"
+    },
+    {
+      "process_id": "DelayRisk",
+      "target_date": "2026-11-20",
+      "trigger": "MANUAL",
+      "priority": 3,
+      "delay_sec": 0.139,
+      "initiated_by": "manager_1"
+    },
+    {
+      "process_id": "SpoilageRisk",
+      "target_date": "2026-11-18",
+      "trigger": "AUTO",
+      "priority": 1,
+      "delay_sec": 0.008,
+      "initiated_by": "scheduler_bot"
+    },
+    {
+      "process_id": "SpoilageRisk",
+      "target_date": "2026-11-20",
+      "trigger": "AUTO",
+      "priority": 1,
+      "delay_sec": 0.228,
+      "initiated_by": "scheduler_bot"
+    },
+    {
+      "process_id": "SpoilageRisk",
+      "target_date": "2026-11-20",
+      "trigger": "MANUAL",
+      "priority": 2,
+      "delay_sec": 0.036,
+      "initiated_by": "manager_1"
+    }
+  ]
+}
