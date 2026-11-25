@@ -15,6 +15,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from core.models import (
+    AccessMode, LockScope, ProcessSpec, ResourceRule, TaskRun, TaskStatus,
+    TriggerType, from_utc, to_utc,
+)
+
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 # ---------------------------------------------------------------------------
@@ -625,3 +630,72 @@ class Storage:
 
     def get_conflict_matrix(self) -> list[dict[str, Any]]:
         return self._query("SELECT * FROM v_conflict_matrix")
+
+    def get_process_specs(self) -> list[ProcessSpec]:
+        """Read current database configuration, rather than seed constants."""
+        rules = self.get_resource_rules()
+        specs = []
+        for row in self._query("SELECT * FROM processes ORDER BY process_id"):
+            resources = tuple(rules.get(row["process_id"], ()))
+            specs.append(ProcessSpec(
+                row["process_id"], row["display_name"],
+                tuple(r.source_id for r in resources if r.access_mode in (AccessMode.READ, AccessMode.READ_WRITE)),
+                tuple(r.source_id for r in resources if r.access_mode != AccessMode.READ),
+                bool(row["allow_parallel_dates"]), row["default_priority"], resources,
+                bool(row["uses_shared_staging"]), row["staging_key"], row["timeout_sec"],
+                row["estimated_duration_s"], bool(row["is_active"]),
+            ))
+        return specs
+
+    def get_resource_rules(self) -> dict[str, list[ResourceRule]]:
+        result: dict[str, list[ResourceRule]] = {}
+        for row in self._query("SELECT * FROM process_source_rules ORDER BY acquire_order, rule_id"):
+            result.setdefault(row["process_id"], []).append(ResourceRule(
+                row["source_id"], AccessMode(row["access_mode"]),
+                LockScope(row["lock_scope"]), row["acquire_order"],
+            ))
+        return result
+
+    def load_tasks(self) -> list[TaskRun]:
+        return [TaskRun(
+            task_id=r["task_id"], process_id=r["process_id"], target_date=r["target_date"],
+            trigger=TriggerType(r["trigger_type"]), priority=r["priority"],
+            status=TaskStatus(r["status"]), progress=r["progress"], queued_at=from_utc(r["queued_at"]),
+            started_at=from_utc(r["started_at"]), finished_at=from_utc(r["finished_at"]),
+            blocked_by=r["blocked_by"], error_message=r["error_message"],
+            result=json.loads(r["result_json"]) if r["result_json"] else None,
+            initiated_by=r["initiated_by"], session_id=r["session_id"], run_id=r["run_id"],
+            effective_priority=r["effective_priority"], error_type=r["error_type"],
+            orchestration_enabled=bool(r["orchestration_enabled"]),
+        ) for r in self.list_tasks(order_by="task_id")]
+
+    def save_task(self, task: TaskRun) -> None:
+        self.update_task(
+            task.task_id, status=task.status.value, progress=task.progress,
+            effective_priority=task.effective_priority if task.effective_priority is not None else task.priority,
+            started_at=to_utc(task.started_at), finished_at=to_utc(task.finished_at),
+            blocked_by=task.blocked_by, error_type=task.error_type,
+            error_message=task.error_message, result_json=self._json_text(task.result),
+            wait_duration_ms=int((task.started_at - task.queued_at).total_seconds() * 1000)
+            if task.started_at else None,
+            exec_duration_ms=int((task.finished_at - task.started_at).total_seconds() * 1000)
+            if task.started_at and task.finished_at else None,
+        )
+
+    def refresh_run_metrics(self, run_id: int) -> None:
+        """Populate the stored aggregates consumed by v_before_after_comparison."""
+        row = self._query_one("""
+            SELECT COUNT(*) AS total_tasks,
+                COALESCE(SUM(status = 'COMPLETED'), 0) AS completed_tasks,
+                COALESCE(SUM(status = 'FAILED'), 0) AS failed_tasks,
+                COALESCE(SUM(status = 'CANCELLED'), 0) AS cancelled_tasks,
+                COALESCE(SUM(error_type = 'DeadlockError'), 0) AS deadlock_count,
+                COALESCE(SUM(error_type = 'DataCorruptionError'), 0) AS data_corruption_count,
+                COALESCE(SUM(error_type = 'CrossDateCollisionError'), 0) AS cross_date_collisions,
+                COALESCE(AVG(wait_duration_ms) / 1000.0, 0) AS avg_wait_sec,
+                COALESCE(MAX(wait_duration_ms) / 1000.0, 0) AS max_wait_sec,
+                COALESCE((julianday(MAX(COALESCE(finished_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))))
+                    - julianday(MIN(queued_at))) * 86400, 0) AS total_makespan_sec
+            FROM task_runs WHERE run_id = ?
+        """, (run_id,))
+        self.update_simulation_run(run_id, **row)
