@@ -107,7 +107,7 @@
 ### Шаг 1. Клонирование репозитория
 
 ```bash
-git clone <https://github.com/kraaack1337/risk-orchestrator.git>
+git clone https://github.com/kraaack1337/risk-orchestrator.git
 cd risk-orchestrator
 ```
 
