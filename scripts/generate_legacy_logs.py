@@ -11,14 +11,14 @@ import argparse
 import json
 import random
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
 def generate_legacy_logs(
     out_dir: Path,
     seed: int = 42,
-    start_ts: datetime = datetime(2026, 11, 20, 6, 0, 0, tzinfo=timezone.utc),
+    start_ts: datetime = datetime(2026, 11, 20, 6, 0, 0, tzinfo=UTC),
 ) -> dict[str, object]:
     rng = random.Random(seed)
     out_dir.mkdir(parents=True, exist_ok=True)

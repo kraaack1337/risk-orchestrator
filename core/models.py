@@ -4,9 +4,31 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
+
+STOCKOUT_RISK = "StockoutRisk"
+DELAY_RISK = "DelayRisk"
+SPOILAGE_RISK = "SpoilageRisk"
+CARRIER_DEFAULT_RISK = "CarrierDefaultRisk"
+PROCESS_IDS: tuple[str, ...] = (
+    STOCKOUT_RISK,
+    DELAY_RISK,
+    SPOILAGE_RISK,
+    CARRIER_DEFAULT_RISK,
+)
+
+WAREHOUSE_STOCKS = "WarehouseStocks"
+TRANSIT_TELEMETRY = "TransitTelemetry"
+WEATHER_AND_TRAFFIC = "WeatherAndTraffic"
+SUPPLIER_SLA = "SupplierSLA"
+SOURCE_IDS: tuple[str, ...] = (
+    WAREHOUSE_STOCKS,
+    TRANSIT_TELEMETRY,
+    WEATHER_AND_TRAFFIC,
+    SUPPLIER_SLA,
+)
 
 
 class TaskStatus(str, Enum):
@@ -53,14 +75,15 @@ class ProcessSpec:
     display_name: str
     read_sources: tuple[str, ...]
     write_sources: tuple[str, ...]
-    allow_parallel_dates: bool
-    default_priority: int
+    allow_parallel_dates: bool = True
+    default_priority: int = 2
     resource_rules: tuple[ResourceRule, ...] = ()
     uses_shared_staging: bool = False
     staging_key: str | None = None
     timeout_sec: float = 30.0
     estimated_duration_s: float = 4.0
     is_active: bool = True
+    global_sources: tuple[str, ...] = (SUPPLIER_SLA,)
 
 
 @dataclass
@@ -72,6 +95,7 @@ class TaskRequest:
     delay_sec: float = 0.0
     initiated_by: str | None = None
     session_id: str | None = None
+    idempotency_key: str | None = None
 
 
 @dataclass
@@ -95,6 +119,10 @@ class TaskRun:
     effective_priority: float | None = None
     error_type: str | None = None
     orchestration_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if self.effective_priority is None:
+            self.effective_priority = float(self.priority)
 
 
 @dataclass
@@ -134,7 +162,7 @@ class CrossDateCollisionError(RuntimeError):
 
 def to_utc(value: datetime | None) -> str | None:
     """Interpret naive UI time in the host's local zone, then serialize UTC."""
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if value else None
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z") if value else None
 
 
 def from_utc(value: str | None) -> datetime | None:
@@ -142,5 +170,5 @@ def from_utc(value: str | None) -> datetime | None:
         return None
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone().replace(tzinfo=None)

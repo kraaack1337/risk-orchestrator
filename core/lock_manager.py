@@ -95,7 +95,9 @@ class LockManager:
             ]
             if conflicts:
                 resource, owner = conflicts[0]
-                reason = f"Ожидает ресурс {resource.key}, удерживаемый задачей #{owner}"
+                owner_task = self._tasks.get(owner)
+                owner_label = f"#{owner} {owner_task.process_id}" if owner_task else f"#{owner}"
+                reason = f"Ожидает {resource.key} (занят {owner_label})"
                 if task.blocked_by != reason:
                     self._audit(task, tuple(dict.fromkeys(r for r, _ in conflicts)),
                                 "WAIT_CONFLICT", sorted({owner for _, owner in conflicts}))

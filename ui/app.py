@@ -1,433 +1,457 @@
-"""Main NiceGUI application for the Risk Orchestrator MVP.
+"""Native Desktop Application 'RiskFlow Orchestrator' (CustomTkinter + matplotlib FigureCanvasTkAgg).
 
-Integrates with any Orchestrator & ReglamentScheduler implementing Section 5.4
-contracts, and falls back to the built-in MockOrchestrator when launched standalone.
+Designed after real engineering consoles (Temporal UI, DBeaver Session Manager, Linear).
+Supports standalone execution (`python ui/app.py` -> MockOrchestrator) as well as full
+integration with Core Orchestrator + SQLite WAL via `main.py`.
 """
 
 from __future__ import annotations
 
-import argparse
-from dataclasses import dataclass
-from pathlib import Path
+import asyncio
 import sys
+import uuid
+from collections.abc import Coroutine
+from pathlib import Path
 from typing import Any
 
-# Allow running directly via `python ui/app.py` in addition to `python -m ui.app`
 if __package__ in (None, ""):
     _ROOT = Path(__file__).resolve().parent.parent
     if str(_ROOT) not in sys.path:
         sys.path.insert(0, str(_ROOT))
 
-from nicegui import app as nicegui_app
-from nicegui import ui
-
+from ui.assets.theme import (
+    BG_ELEVATED,
+    BG_MAIN,
+    BG_PANEL,
+    BORDER,
+    CORNER_RADIUS,
+    STATUS_RUNNING,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
+    font_ui,
+)
 from ui.components import (
-    ControlPanel,
-    Dashboard,
-    EventLogAndLocksPanel,
+    CommandToolbar,
+    DashboardPanel,
     GanttChartPanel,
+    InspectorAndLogDock,
     ManualLaunchForm,
-    render_conflict_matrix,
+    RulesAndReglamentView,
+    ScenariosDockBlock,
 )
 from ui.contracts import (
     OrchestratorProtocol,
-    RandomBatchGenerator,
     ScenarioSpec,
     SchedulerProtocol,
     status_key,
 )
-from ui.mock_backend import (
-    MockOrchestrator,
-    MockReglamentScheduler,
-    generate_mock_random_batch,
-    get_mock_demo_scenarios,
-)
 
-ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-STYLES_PATH = ASSETS_DIR / "styles.css"
+TAB_DISPATCHER = "Диспетчер и Таймлайн"
+TAB_MATRIX = "Матрица конфликтов и Регламент"
 
 
-@dataclass
-class _ResolvedRuntime:
-    orchestrator: OrchestratorProtocol
-    scheduler: SchedulerProtocol | None
-    scenarios: list[ScenarioSpec]
-    random_batch_fn: RandomBatchGenerator | None
-    engine_label: str
-    is_mock: bool
+def resolve_demo_scenarios(scenarios: list[ScenarioSpec] | None = None) -> list[ScenarioSpec]:
+    if scenarios is not None:
+        return list(scenarios)
+    from services.scenarios import get_demo_scenarios
+
+    return list(get_demo_scenarios())
 
 
-def resolve_scenarios(
-    scenarios: list[ScenarioSpec] | None = None,
-    random_batch_fn: RandomBatchGenerator | None = None,
-) -> tuple[list[ScenarioSpec], RandomBatchGenerator | None]:
-    """Load scenarios from services.scenarios when available, else use built-in mock scenarios."""
-    resolved_scenarios = scenarios
-    resolved_random = random_batch_fn
-
-    if resolved_scenarios is None or resolved_random is None:
-        try:
-            from services.scenarios import (  # type: ignore[import-not-found]
-                generate_random_batch,
-                get_demo_scenarios,
-            )
-
-            if resolved_scenarios is None:
-                resolved_scenarios = list(get_demo_scenarios())
-            if resolved_random is None:
-                resolved_random = generate_random_batch
-        except ImportError:
-            if resolved_scenarios is None:
-                resolved_scenarios = get_mock_demo_scenarios()
-            if resolved_random is None:
-                resolved_random = generate_mock_random_batch
-
-    return resolved_scenarios, resolved_random
-
-
-def _resolve_runtime(
-    orchestrator: OrchestratorProtocol | None,
-    scheduler: SchedulerProtocol | None,
-    scenarios: list[ScenarioSpec] | None,
-    random_batch_fn: RandomBatchGenerator | None,
-) -> _ResolvedRuntime:
-    resolved_scenarios, resolved_random = resolve_scenarios(scenarios, random_batch_fn)
-
-    if orchestrator is not None:
-        is_mock = isinstance(orchestrator, MockOrchestrator)
-        label = "Mock Demo Engine" if is_mock else "Core Engine"
-        return _ResolvedRuntime(
-            orchestrator=orchestrator,
-            scheduler=scheduler,
-            scenarios=resolved_scenarios,
-            random_batch_fn=resolved_random,
-            engine_label=label,
-            is_mock=is_mock,
-        )
-
-    mock_orch = MockOrchestrator()
-    mock_sched = scheduler if scheduler is not None else MockReglamentScheduler(mock_orch, interval=15.0)
-    return _ResolvedRuntime(
-        orchestrator=mock_orch,
-        scheduler=mock_sched,
-        scenarios=resolved_scenarios,
-        random_batch_fn=resolved_random,
-        engine_label="Mock Demo Engine",
-        is_mock=True,
-    )
-
-
-class _UIStateHub:
-    """Single orchestrator subscriber that safely fans out dirty notifications to active UI tabs."""
-
-    def __init__(self, orchestrator: OrchestratorProtocol) -> None:
-        self._sessions: set[_PageSession] = set()
-        orchestrator.subscribe(self.notify_all)
-
-    def register(self, session: _PageSession) -> None:
-        self._sessions.add(session)
-
-    def unregister(self, session: _PageSession) -> None:
-        self._sessions.discard(session)
-
-    def notify_all(self) -> None:
-        for session in list(self._sessions):
-            session.mark_dirty()
-
-
-class _PageSession:
-    """Per-browser-client controller managing live refresh without leaks or flicker."""
+class _WorkspaceController:
+    """Reusable 4-zone workspace mounted inside the main CTk window or secondary CTkToplevel."""
 
     def __init__(
         self,
-        runtime: _ResolvedRuntime,
-        hub: _UIStateHub,
+        window: Any,
+        orchestrator: OrchestratorProtocol,
+        scheduler: SchedulerProtocol | None,
+        scenarios: list[ScenarioSpec],
+        loop: asyncio.AbstractEventLoop,
+        *,
+        initial_user: str = "analyst_1",
+        on_open_new_window: Any = None,
+        is_secondary: bool = False,
+        on_close_callback: Any = None,
     ) -> None:
-        self._runtime = runtime
-        self._hub = hub
+        import customtkinter as ctk
+
+        self.window = window
+        self._ctk = ctk
+        self._orchestrator = orchestrator
+        self._scheduler = scheduler
+        self._scenarios = scenarios
+        self._loop = loop
+        self._user_id = initial_user
+        self._session_id: str | None = None
         self._dirty = True
         self._closed = False
-        self._is_dark = False
+        self._after_id: str | None = None
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._on_close_callback = on_close_callback
 
-        self._dark_mode: Any = None
-        self._theme_btn: Any = None
-        self._header_mode_badge: Any = None
-        self._control_panel: ControlPanel | None = None
-        self._manual_form: ManualLaunchForm | None = None
-        self._dashboard: Dashboard | None = None
-        self._gantt: GanttChartPanel | None = None
-        self._event_log: EventLogAndLocksPanel | None = None
-        self._timer: Any = None
+        self._register_db_session()
+        self._orchestrator.subscribe(self.mark_dirty)
+
+        window.configure(fg_color=BG_MAIN)
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(0, weight=0)
+        window.grid_rowconfigure(1, weight=1)
+
+        # ---- Zone 1: Top Unified Command Toolbar (48px) ----
+        self._toolbar = CommandToolbar(
+            parent=window,
+            orchestrator=orchestrator,
+            scheduler=scheduler,
+            dispatch_async=self.dispatch_async,
+            on_user_changed=self._handle_user_changed,
+            on_open_new_window=on_open_new_window,
+            on_force_refresh=self.force_refresh,
+            initial_user=initial_user,
+            is_secondary_window=is_secondary,
+        )
+        self._toolbar.frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+
+        # ---- Main 3-Column Body Container ----
+        body = ctk.CTkFrame(window, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        body.grid_columnconfigure(0, weight=0, minsize=330)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_columnconfigure(2, weight=0, minsize=370)
+        body.grid_rowconfigure(0, weight=1)
+
+        # ---- Zone 2: Left Dock Sidebar (330px: Scenarios + Manual Launch) ----
+        left_dock = ctk.CTkFrame(body, width=330, fg_color="transparent")
+        left_dock.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left_dock.grid_propagate(False)
+        left_dock.grid_columnconfigure(0, weight=1)
+        left_dock.grid_rowconfigure(0, weight=0)
+        left_dock.grid_rowconfigure(1, weight=1)
+
+        self._scenarios_block = ScenariosDockBlock(
+            parent=left_dock,
+            orchestrator=orchestrator,
+            scenarios=scenarios,
+            dispatch_async=self.dispatch_async,
+            on_force_refresh=self.force_refresh,
+        )
+        self._scenarios_block.frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        self._manual_form = ManualLaunchForm(
+            parent=left_dock,
+            orchestrator=orchestrator,
+            dispatch_async=self.dispatch_async,
+            get_user_context=self.get_user_context,
+            on_force_refresh=self.force_refresh,
+        )
+        self._manual_form.frame.grid(row=1, column=0, sticky="new")
+
+        # ---- Zone 3: Center Workspace (CTkTabview with 2 tabs) ----
+        self._tabs = ctk.CTkTabview(
+            body,
+            fg_color=BG_PANEL,
+            corner_radius=CORNER_RADIUS,
+            border_width=1,
+            border_color=BORDER,
+            segmented_button_fg_color=BG_MAIN,
+            segmented_button_selected_color=STATUS_RUNNING,
+            segmented_button_selected_hover_color="#1F6FEB",
+            segmented_button_unselected_color=BG_ELEVATED,
+            segmented_button_unselected_hover_color=BG_PANEL,
+            text_color=TEXT_PRIMARY,
+            text_color_disabled=TEXT_MUTED,
+        )
+        self._tabs.grid(row=0, column=1, sticky="nsew", padx=0)
+        self._tabs._segmented_button.configure(font=font_ui(11, "bold"), height=28)
+
+        tab_disp = self._tabs.add(TAB_DISPATCHER)
+        tab_rules = self._tabs.add(TAB_MATRIX)
+
+        tab_disp.grid_columnconfigure(0, weight=1)
+        tab_disp.grid_rowconfigure(0, weight=0)
+        tab_disp.grid_rowconfigure(1, weight=1)
+
+        self._dashboard = DashboardPanel(
+            parent=tab_disp,
+            orchestrator=orchestrator,
+            dispatch_async=self.dispatch_async,
+            on_select_task=self._handle_select_task,
+            on_force_refresh=self.force_refresh,
+        )
+        self._dashboard.frame.grid(row=0, column=0, sticky="ew", padx=2, pady=(2, 6))
+
+        self._gantt = GanttChartPanel(
+            parent=tab_disp,
+            orchestrator=orchestrator,
+            on_select_task=self._handle_select_task,
+        )
+        self._gantt.frame.grid(row=1, column=0, sticky="nsew", padx=2, pady=(0, 2))
+
+        tab_rules.grid_columnconfigure(0, weight=1)
+        tab_rules.grid_rowconfigure(0, weight=1)
+        self._rules_view = RulesAndReglamentView(
+            parent=tab_rules,
+            orchestrator=orchestrator,
+            scheduler=scheduler,
+            on_force_refresh=self.force_refresh,
+        )
+        self._rules_view.frame.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+
+        # ---- Zone 4: Right Inspector & Logs Dock (340px) ----
+        self._inspector_dock = InspectorAndLogDock(
+            parent=body,
+            orchestrator=orchestrator,
+        )
+        self._inspector_dock.frame.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+
+        window.protocol("WM_DELETE_WINDOW", self.close)
+        self.force_refresh()
+        self._schedule_next_poll()
+
+    def _register_db_session(self) -> None:
+        storage = getattr(self._orchestrator, "storage", None)
+        if storage is None:
+            return
+        sid = f"desk-{uuid.uuid4().hex[:10]}"
+        try:
+            storage.create_session(
+                session_id=sid,
+                user_id=self._user_id,
+                client_id="customtkinter",
+            )
+            self._session_id = sid
+        except Exception:
+            self._session_id = None
+
+    def get_user_context(self) -> tuple[str, str | None]:
+        return self._user_id, self._session_id
+
+    def _handle_user_changed(self, user_id: str) -> None:
+        self._user_id = user_id
+        storage = getattr(self._orchestrator, "storage", None)
+        if storage is not None and self._session_id is not None:
+            try:
+                storage.update_session(self._session_id, user_id=user_id)
+            except Exception:
+                pass
+
+    def _handle_select_task(self, task_id: int) -> None:
+        self._dashboard.set_selected_task(task_id)
+        self._gantt.set_selected_task(task_id)
+        self._inspector_dock.set_selected_task(task_id)
+        self._inspector_dock.refresh()
+
+    def dispatch_async(self, coro: Coroutine[Any, Any, Any]) -> None:
+        task = self._loop.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     def mark_dirty(self) -> None:
         self._dirty = True
 
-    def close(self) -> None:
-        self._closed = True
-        self._hub.unregister(self)
-        if self._timer is not None:
-            try:
-                self._timer.deactivate()
-            except Exception:
-                pass
-
-    def build(self) -> None:
-        if STYLES_PATH.exists():
-            ui.add_css(STYLES_PATH)
-
-        self._dark_mode = ui.dark_mode(value=False)
-
-        # Register cleanup when client disconnects or is deleted
-        client = ui.context.client
-        client.on_disconnect(self.close)
-        client.on_delete(self.close)
-        self._hub.register(self)
-
-        specs = self._runtime.orchestrator.get_process_specs()
-
-        # Conflict Matrix popup dialog
-        with ui.dialog() as matrix_dialog, ui.card().classes("w-full max-w-5xl p-5"):
-            with ui.row().classes("w-full items-center justify-between mb-2"):
-                with ui.row().classes("items-center gap-2"):
-                    ui.icon("grid_on", size="sm").classes("text-indigo-600")
-                    ui.label("Матрица зависимостей и конфликтов READ/WRITE").classes(
-                        "text-lg font-semibold"
-                    )
-                ui.button(icon="close", on_click=matrix_dialog.close).props("flat round dense")
-            render_conflict_matrix(specs)
-
-        # Top navigation header
-        with ui.header(elevated=True).classes("ro-header px-5 py-2.5 text-white"):
-            with ui.row().classes("w-full max-w-[1480px] mx-auto items-center justify-between flex-wrap gap-3"):
-                with ui.row().classes("items-center gap-3"):
-                    with ui.element("div").classes(
-                        "w-9 h-9 rounded-xl bg-blue-600/90 flex items-center justify-center shadow"
-                    ):
-                        ui.icon("account_tree", size="sm", color="white")
-                    with ui.column().classes("gap-0"):
-                        ui.label("Risk Orchestrator").classes("text-lg font-bold leading-tight tracking-tight")
-                        ui.label("Оркестратор оценки рисков · Логистика и цепи поставок").classes(
-                            "text-xs text-slate-300"
-                        )
-
-                with ui.row().classes("items-center gap-2 flex-wrap"):
-                    ui.badge(
-                        self._runtime.engine_label,
-                        color="amber-7" if self._runtime.is_mock else "positive",
-                    ).props("outline rounded").classes("text-xs px-2 py-1")
-
-                    self._header_mode_badge = ui.badge("", color="positive").props("rounded").classes(
-                        "text-xs px-2.5 py-1 font-semibold"
-                    )
-
-                    ui.button(
-                        "Матрица конфликтов",
-                        icon="grid_on",
-                        on_click=matrix_dialog.open,
-                    ).props("flat dense no-caps color=white").classes(
-                        "text-xs bg-white/10 hover:bg-white/20 px-3 py-1 rounded-lg"
-                    )
-
-                    self._theme_btn = ui.button(
-                        icon="dark_mode",
-                        on_click=self._toggle_theme,
-                    ).props("flat round dense color=white")
-                    self._theme_btn.tooltip("Переключить светлую / тёмную тему")
-
-        # Main workspace container
-        with ui.column().classes("w-full max-w-[1480px] mx-auto px-4 py-4 gap-4"):
-            # Row 1: Control Panel (8 cols) + Manual Launch Form (4 cols)
-            self._dashboard = Dashboard(self._runtime.orchestrator)
-
-            with ui.element("div").classes("w-full grid grid-cols-1 xl:grid-cols-12 gap-4 items-stretch"):
-                with ui.element("div").classes("xl:col-span-8 flex"):
-                    self._control_panel = ControlPanel(
-                        orchestrator=self._runtime.orchestrator,
-                        scheduler=self._runtime.scheduler,
-                        scenarios=self._runtime.scenarios,
-                        random_batch_fn=self._runtime.random_batch_fn,
-                        on_snapshot_mode=self._dashboard.capture_snapshot,
-                        on_after_action=self.refresh_now,
-                    )
-                    self._control_panel.build()
-
-                with ui.element("div").classes("xl:col-span-4 flex"):
-                    self._manual_form = ManualLaunchForm(
-                        orchestrator=self._runtime.orchestrator,
-                        on_submitted=self.refresh_now,
-                    )
-                    self._manual_form.build()
-
-            # Row 2: Live KPI metrics + 3-column task dashboard
-            self._dashboard.build()
-
-            # Row 3: Live Plotly Gantt Timeline
-            self._gantt = GanttChartPanel(self._runtime.orchestrator)
-            self._gantt.build()
-
-            # Row 4: Active Locks + Event Journal
-            self._event_log = EventLogAndLocksPanel(self._runtime.orchestrator)
-            self._event_log.build()
-
-            # Row 5: Expandable Conflict Matrix Reference
-            with ui.expansion(
-                "Справка: Матрица зависимостей READ/WRITE и попарных конфликтов",
-                icon="hub",
-            ).classes("ro-card w-full"):
-                with ui.column().classes("p-2 w-full"):
-                    render_conflict_matrix(specs)
-
-        self._update_header_mode()
-        self._timer = ui.timer(0.35, self._on_tick)
-
-    def _toggle_theme(self) -> None:
-        self._is_dark = not self._is_dark
-        if self._dark_mode is not None:
-            self._dark_mode.value = self._is_dark
-        if self._theme_btn is not None:
-            self._theme_btn.props(f"icon={'light_mode' if self._is_dark else 'dark_mode'} flat round dense color=white")
-        if self._gantt is not None:
-            self._gantt.set_dark(self._is_dark)
-
-    def _update_header_mode(self) -> None:
-        if self._header_mode_badge is None:
-            return
-        enabled = self._runtime.orchestrator.is_orchestration_enabled()
-        if enabled:
-            self._header_mode_badge.text = "Защита: ВКЛ"
-            self._header_mode_badge.props("color=positive rounded")
-        else:
-            self._header_mode_badge.text = "Режим хаоса: БЕЗ защиты"
-            self._header_mode_badge.props("color=negative rounded")
-
-    def refresh_now(self) -> None:
+    def force_refresh(self) -> None:
         if self._closed:
             return
         self._dirty = False
-        self._update_header_mode()
-        if self._control_panel is not None:
-            self._control_panel.refresh()
-        if self._dashboard is not None:
-            self._dashboard.refresh()
-        if self._gantt is not None:
-            self._gantt.refresh()
-        if self._event_log is not None:
-            self._event_log.refresh()
+        tasks = self._orchestrator.get_tasks()
+        metrics = self._orchestrator.get_metrics() or {}
+        self._toolbar.refresh()
+        self._dashboard.refresh(tasks=tasks, metrics=metrics)
+        self._gantt.refresh(force=False)
+        self._inspector_dock.refresh(tasks=tasks)
+        if self._tabs.get() == TAB_MATRIX:
+            self._rules_view.refresh()
 
-    def _on_tick(self) -> None:
+    def _schedule_next_poll(self) -> None:
+        if not self._closed:
+            self._after_id = self.window.after(120, self._refresh_ui)
+
+    def _refresh_ui(self) -> None:
         if self._closed:
             return
-        has_active = any(
-            status_key(t.status) in ("RUNNING", "QUEUED")
-            for t in self._runtime.orchestrator.get_tasks()
-        )
-        if not self._dirty and not has_active:
+        try:
+            tasks = self._orchestrator.get_tasks()
+            has_active = any(status_key(t.status) in ("RUNNING", "QUEUED") for t in tasks)
+            if self._dirty or has_active:
+                self._dirty = False
+                metrics = self._orchestrator.get_metrics() or {}
+                self._toolbar.refresh()
+                self._dashboard.refresh(tasks=tasks, metrics=metrics)
+                self._gantt.refresh(force=False)
+                self._inspector_dock.refresh(tasks=tasks)
+                if self._tabs.get() == TAB_MATRIX:
+                    self._rules_view.refresh()
+        finally:
+            self._schedule_next_poll()
+
+    def close(self) -> None:
+        if self._closed:
             return
-        self.refresh_now()
+        self._closed = True
+        unsub = getattr(self._orchestrator, "unsubscribe", None)
+        if callable(unsub):
+            try:
+                unsub(self.mark_dirty)
+            except Exception:
+                pass
+        if self._after_id is not None:
+            try:
+                self.window.after_cancel(self._after_id)
+            except Exception:
+                pass
+        storage = getattr(self._orchestrator, "storage", None)
+        if storage is not None and self._session_id is not None:
+            try:
+                storage.mark_session_disconnected(self._session_id)
+            except Exception:
+                pass
+        if self._on_close_callback is not None:
+            self._on_close_callback(self)
+        try:
+            self.window.destroy()
+        except Exception:
+            pass
 
 
-_ACTIVE_RUNTIME: _ResolvedRuntime | None = None
-_ACTIVE_HUB: _UIStateHub | None = None
-_LIFECYCLE_REGISTERED = False
+class RiskFlowApp:
+    """Top-level native desktop application managing root CTk + secondary CTkToplevel windows."""
 
+    def __init__(
+        self,
+        orchestrator: OrchestratorProtocol | None = None,
+        scheduler: SchedulerProtocol | None = None,
+        scenarios: list[ScenarioSpec] | None = None,
+        *,
+        title: str = "RiskFlow Orchestrator — Система оркестрации оценки рисков",
+    ) -> None:
+        if orchestrator is None:
+            from services.mocks import MockOrchestrator, MockReglamentScheduler
 
-def create_app(
-    orchestrator: OrchestratorProtocol | None = None,
-    scheduler: SchedulerProtocol | None = None,
-    scenarios: list[ScenarioSpec] | None = None,
-    random_batch_fn: RandomBatchGenerator | None = None,
-    *,
-    manage_lifecycle: bool = True,
-) -> _ResolvedRuntime:
-    """Wire the orchestrator/scheduler to NiceGUI page routes without starting the server yet."""
-    global _ACTIVE_RUNTIME, _ACTIVE_HUB, _LIFECYCLE_REGISTERED
+            mock_orch = MockOrchestrator()
+            orchestrator = mock_orch
+            if scheduler is None:
+                scheduler = MockReglamentScheduler(mock_orch, interval=15.0)
+            self._is_standalone_mock = True
+        else:
+            self._is_standalone_mock = False
 
-    runtime = _resolve_runtime(orchestrator, scheduler, scenarios, random_batch_fn)
-    hub = _UIStateHub(runtime.orchestrator)
-    _ACTIVE_RUNTIME = runtime
-    _ACTIVE_HUB = hub
+        self.orchestrator = orchestrator
+        self.scheduler = scheduler
+        self.scenarios = resolve_demo_scenarios(scenarios)
+        self.title = title
+        self._secondary_controllers: list[_WorkspaceController] = []
+        self._window_counter = 1
 
-    if manage_lifecycle and not _LIFECYCLE_REGISTERED:
-        _LIFECYCLE_REGISTERED = True
+    def _open_analyst_window(self, root: Any, loop: asyncio.AbstractEventLoop) -> None:
+        import customtkinter as ctk
 
-        async def _on_startup() -> None:
-            if _ACTIVE_RUNTIME is not None:
-                await _ACTIVE_RUNTIME.orchestrator.start()
+        self._window_counter += 1
+        default_users = ["analyst_2", "manager_1", "analyst_1"]
+        chosen_user = default_users[(self._window_counter - 2) % len(default_users)]
 
-        async def _on_shutdown() -> None:
-            if _ACTIVE_RUNTIME is None:
-                return
-            sched = _ACTIVE_RUNTIME.scheduler
-            if sched is not None:
-                sched.set_enabled(False)
-                stop_sched = getattr(sched, "stop", None)
-                if callable(stop_sched):
-                    res = stop_sched()
-                    if hasattr(res, "__await__"):
-                        await res
-            await _ACTIVE_RUNTIME.orchestrator.stop()
+        top = ctk.CTkToplevel(root)
+        top.title(f"RiskFlow Orchestrator — Окно аналитика #{self._window_counter} ({chosen_user})")
+        top.geometry("1380x860")
+        top.minsize(1200, 760)
 
-        nicegui_app.on_startup(_on_startup)
-        nicegui_app.on_shutdown(_on_shutdown)
+        ctrl = _WorkspaceController(
+            window=top,
+            orchestrator=self.orchestrator,
+            scheduler=self.scheduler,
+            scenarios=self.scenarios,
+            loop=loop,
+            initial_user=chosen_user,
+            on_open_new_window=lambda: self._open_analyst_window(root, loop),
+            is_secondary=True,
+            on_close_callback=lambda c: self._secondary_controllers.remove(c)
+            if c in self._secondary_controllers
+            else None,
+        )
+        self._secondary_controllers.append(ctrl)
 
-    @ui.page("/")
-    def index_page() -> None:
-        assert _ACTIVE_RUNTIME is not None and _ACTIVE_HUB is not None
-        session = _PageSession(_ACTIVE_RUNTIME, _ACTIVE_HUB)
-        session.build()
+    def run(self) -> None:
+        try:
+            import customtkinter as ctk
+        except ImportError as exc:
+            if "libtk" in str(exc) or "_tkinter" in str(exc):
+                raise SystemExit(
+                    "Не найдена системная библиотека Tcl/Tk (libtk8.6.so) для запуска нативного окна.\n"
+                    "Установите пакет tk:\n"
+                    "  • Arch / CachyOS / Manjaro : sudo pacman -S tk\n"
+                    "  • Ubuntu / Debian          : sudo apt install python3-tk\n"
+                    "  • Fedora                   : sudo dnf install python3-tkinter"
+                ) from exc
+            raise
 
-    return runtime
+        ctk.set_appearance_mode("dark")
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        root = ctk.CTk()
+        if root.winfo_screenwidth() >= 2200:
+            ctk.set_widget_scaling(1.15)
+        title_suffix = " [Autonomous Mock Engine]" if self._is_standalone_mock else ""
+        root.title(f"{self.title}{title_suffix}")
+        root.geometry("1600x980")
+        root.minsize(1360, 840)
+
+        loop.run_until_complete(self.orchestrator.start())
+
+        main_ctrl = _WorkspaceController(
+            window=root,
+            orchestrator=self.orchestrator,
+            scheduler=self.scheduler,
+            scenarios=self.scenarios,
+            loop=loop,
+            initial_user="analyst_1",
+            on_open_new_window=lambda: self._open_analyst_window(root, loop),
+            is_secondary=False,
+        )
+
+        def _on_root_close() -> None:
+            for sec in list(self._secondary_controllers):
+                sec.close()
+            main_ctrl.close()
+
+        root.protocol("WM_DELETE_WINDOW", _on_root_close)
+
+        try:
+            from async_tkinter_loop import async_mainloop
+
+            async_mainloop(root, event_loop=loop)
+        finally:
+            async def _shutdown() -> None:
+                if self.scheduler is not None:
+                    self.scheduler.set_enabled(False)
+                    stop_fn = getattr(self.scheduler, "stop", None)
+                    if callable(stop_fn):
+                        res = stop_fn()
+                        if hasattr(res, "__await__"):
+                            await res
+                await self.orchestrator.stop()
+
+            if not loop.is_closed():
+                loop.run_until_complete(_shutdown())
+                loop.close()
 
 
 def run_ui(
     orchestrator: OrchestratorProtocol | None = None,
     scheduler: SchedulerProtocol | None = None,
     scenarios: list[ScenarioSpec] | None = None,
-    random_batch_fn: RandomBatchGenerator | None = None,
     *,
-    host: str = "127.0.0.1",
-    port: int = 8080,
-    native: bool = False,
-    reload: bool = False,
-    show: bool = True,
-    title: str = "Risk Orchestrator — Оркестратор оценки рисков",
-    manage_lifecycle: bool = True,
+    title: str = "RiskFlow Orchestrator — Система оркестрации оценки рисков",
 ) -> None:
-    """Configure routes and start the NiceGUI web/desktop application."""
-    create_app(
+    """Entry point used by main.py and standalone execution."""
+    app = RiskFlowApp(
         orchestrator=orchestrator,
         scheduler=scheduler,
         scenarios=scenarios,
-        random_batch_fn=random_batch_fn,
-        manage_lifecycle=manage_lifecycle,
-    )
-    ui.run(
-        host=host,
-        port=port,
         title=title,
-        native=native,
-        reload=reload,
-        show=show,
-        dark=False,
-        language="ru",
     )
+    app.run()
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Risk Orchestrator NiceGUI dashboard")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8080, help="Bind port (default: 8080)")
-    parser.add_argument("--native", action="store_true", help="Launch as desktop native window")
-    parser.add_argument("--no-show", action="store_true", help="Do not auto-open browser window")
-    return parser.parse_args()
-
-
-if __name__ in {"__main__", "__mp_main__"}:
-    args = _parse_args()
-    run_ui(
-        host=args.host,
-        port=args.port,
-        native=args.native,
-        reload=False,
-        show=not args.no_show,
-    )
+if __name__ == "__main__":
+    run_ui()

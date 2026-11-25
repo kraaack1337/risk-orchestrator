@@ -15,8 +15,18 @@ from typing import Any
 
 from core.lock_manager import LockManager
 from core.models import (
-    AccessMode, LockScope, OrchestratorEvent, ProcessSpec, ResourceRule,
-    StateChangeCallback, TaskRequest, TaskRun, TaskStatus, TriggerType, from_utc, to_utc,
+    AccessMode,
+    LockScope,
+    OrchestratorEvent,
+    ProcessSpec,
+    ResourceRule,
+    StateChangeCallback,
+    TaskRequest,
+    TaskRun,
+    TaskStatus,
+    TriggerType,
+    from_utc,
+    to_utc,
 )
 from core.storage import Storage
 
@@ -28,7 +38,7 @@ class Orchestrator:
     def __init__(
         self, services: Mapping[str, Any], storage: Storage | None = None,
         process_specs: Sequence[ProcessSpec] | None = None, *,
-        orchestration_enabled: bool = True, conservative_global_resources: bool = True,
+        orchestration_enabled: bool = True, conservative_global_resources: bool = False,
         aging_interval_sec: float = 15.0,
     ) -> None:
         if not math.isfinite(aging_interval_sec) or aging_interval_sec <= 0:
@@ -174,10 +184,22 @@ class Orchestrator:
         self._run_id = None
         self._stopping = False
 
-    async def reset(self) -> None:
+    def _reset_service_layers(self) -> None:
+        seen_dbs: set[int] = set()
+        for service in self._services.values():
+            db = getattr(service, "db", None)
+            if db is not None and id(db) not in seen_dbs and callable(getattr(db, "reset", None)):
+                seen_dbs.add(id(db))
+                db.reset()
+
+    async def reset(self, *, clear_storage: bool = False) -> None:
         async with self._lifecycle:
             restart = self._running
             await self._stop()
+            self._reset_service_layers()
+            if clear_storage and self.storage is not None:
+                self.storage.clear_runtime_data()
+                self._seq = 0
             self._tasks.clear()
             self._events.clear()
             self._paused = False
@@ -209,6 +231,7 @@ class Orchestrator:
         if self.storage and self._run_id is not None:
             self.storage.finalize_simulation_run(self._run_id)
         self._run_id = None
+        self._reset_service_layers()
         self._enabled = enabled
         self._notify()
 
@@ -231,10 +254,11 @@ class Orchestrator:
             if not math.isfinite(spec.timeout_sec) or spec.timeout_sec <= 0:
                 raise ValueError("timeout_sec must be positive and finite")
             priority = 1 if trigger == TriggerType.AUTO else (
-                request.priority if request.priority is not None else max(2, min(3, spec.default_priority))
+                int(request.priority) if request.priority is not None else max(2, min(3, spec.default_priority))
             )
-            if trigger == TriggerType.MANUAL and priority not in (2, 3):
-                raise ValueError("MANUAL priority must be 2 or 3")
+            if priority < 1 or priority > 5:
+                raise ValueError("priority must be between 1 and 5")
+            idemp_key = request.idempotency_key or f"{request.process_id}:{request.target_date}"
             duplicate = self._enabled and any(
                 t.process_id == request.process_id and t.target_date == request.target_date
                 and t.status in _ACTIVE for t in self._tasks.values()
@@ -250,7 +274,7 @@ class Orchestrator:
                 task_id = self.storage.create_task(
                     process_id=request.process_id, target_date=request.target_date, trigger_type=trigger.value,
                     initiated_by=initiated_by, session_id=request.session_id, run_id=self._run_id,
-                    idempotency_key=f"{request.process_id}:{request.target_date}", priority=priority,
+                    idempotency_key=idemp_key, priority=priority,
                     status=status.value, queued_at=to_utc(now), orchestration_enabled=self._enabled,
                 )
             else:
@@ -411,7 +435,8 @@ class Orchestrator:
             error_type = name if name in {
                 "DeadlockError", "DataCorruptionError", "CrossDateCollisionError", "TimeoutError",
             } else "RuntimeError"
-            status, message = TaskStatus.FAILED, f"{name}: {exc}"
+            status = TaskStatus.FAILED
+            message = str(exc) if error_type == name else f"{name}: {exc}"
         finally:
             if service_task is not None:
                 if not service_task.done():
@@ -467,16 +492,31 @@ class Orchestrator:
         runs = [(t.finished_at - t.started_at).total_seconds()
                 for t in tasks if t.started_at and t.finished_at]
         completed, failed = counts[TaskStatus.COMPLETED], counts[TaskStatus.FAILED]
+        deduplicated = counts[TaskStatus.DEDUPLICATED]
+        deadlocks = sum(t.error_type == "DeadlockError" for t in tasks)
+        corruptions = sum(t.error_type == "DataCorruptionError" for t in tasks)
+        cross_date = sum(t.error_type == "CrossDateCollisionError" for t in tasks)
+        finished_total = completed + failed
+        success_rate = 100.0 * completed / finished_total if finished_total else 100.0
+        violations = max(failed, deadlocks + corruptions + cross_date)
+        integrity_score = (
+            round(100.0 * max(0, finished_total - violations) / finished_total, 1)
+            if finished_total
+            else 100.0
+        )
         return {
             "total": len(tasks), "queued": counts[TaskStatus.QUEUED],
             "running": counts[TaskStatus.RUNNING], "completed": completed, "failed": failed,
-            "cancelled": counts[TaskStatus.CANCELLED], "deduplicated": counts[TaskStatus.DEDUPLICATED],
-            "deadlocks": sum(t.error_type == "DeadlockError" for t in tasks),
-            "corruptions": sum(t.error_type == "DataCorruptionError" for t in tasks),
-            "cross_date_collisions": sum(t.error_type == "CrossDateCollisionError" for t in tasks),
+            "cancelled": counts[TaskStatus.CANCELLED],
+            "deduplicated": deduplicated,
+            "deduplicated_count": deduplicated,
+            "deadlocks": deadlocks,
+            "corruptions": corruptions,
+            "cross_date_collisions": cross_date,
             "avg_wait_sec": sum(waits) / len(waits) if waits else 0.0,
             "avg_run_sec": sum(runs) / len(runs) if runs else 0.0,
-            "success_rate": 100 * completed / (completed + failed) if completed + failed else 100.0,
+            "success_rate": success_rate,
+            "integrity_score": integrity_score,
             "active_locks": len(self.get_active_locks()), "max_parallelism": self._max_parallelism,
             "paused": self._paused, "orchestration_enabled": self._enabled,
         }

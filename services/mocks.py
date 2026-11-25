@@ -1,10 +1,11 @@
-"""services/mocks.py — заглушки для автономной работы UI и ядра."""
+"""services/mocks.py — реалистичные заглушки FakeRiskService, MockOrchestrator и MockReglamentScheduler."""
+
 from __future__ import annotations
 
 import asyncio
 import copy
 import inspect
-from datetime import datetime, timedelta
+from datetime import date, datetime
 from typing import Any
 
 from core.models import (
@@ -20,29 +21,51 @@ from core.models import (
     TaskStatus,
     TriggerType,
 )
-from services.microservices import DELAY, PROCESS_SPECS, STOCKOUT, TRANSIT, WAREHOUSE
+from services.microservices import (
+    CARRIER,
+    DELAY,
+    GLOBAL_SOURCES,
+    PROCESS_SPECS,
+    SLA,
+    SPOILAGE,
+    STOCKOUT,
+    TRANSIT,
+    WAREHOUSE,
+)
 
 
 class FakeRiskService:
-    """Эмуляция расчёта ≈2 с (5 шагов по 0.4 с) с прогрессом 20..100."""
+    """Эмуляция расчёта ~3.2 с (5 шагов по 0.64 с) с прогрессом 20..100."""
 
     def __init__(self, spec: ProcessSpec) -> None:
         self.spec = spec
 
-    async def run(self, task_id: int, target_date: str, trigger: TriggerType,
-                  on_progress: ProgressCallback | None = None) -> dict[str, Any]:
+    async def run(
+        self,
+        task_id: int,
+        target_date: str,
+        trigger: TriggerType,
+        on_progress: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
         for pct in (20, 40, 60, 80, 100):
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.64)
             if on_progress:
                 await on_progress(task_id, pct)
-        return {"process_id": self.spec.process_id, "target_date": target_date, "trigger": trigger.name, "fake": True}
+        return {
+            "process_id": self.spec.process_id,
+            "target_date": target_date,
+            "trigger": trigger.value,
+            "risk_score": round(0.18 + (task_id * 17 % 73) / 100.0, 2),
+            "records_checked": 40 + (task_id * 29) % 160,
+        }
 
 
 class MockOrchestrator:
-    """Те же публичные методы, что у Orchestrator; упрощённый планировщик «всё или ничего»."""
+    """Автономный in-memory оркестратор с полной поддержкой контракта Orchestrator (Раздел 5.4)."""
 
     def __init__(self, services: dict[str, Any] | None = None) -> None:
-        self._specs: dict[str, ProcessSpec] = dict(PROCESS_SPECS)
+        self.storage = None
+        self._specs: dict[str, ProcessSpec] = copy.deepcopy(PROCESS_SPECS)
         self._services = services or {pid: FakeRiskService(s) for pid, s in self._specs.items()}
         self._enabled = True
         self._paused = False
@@ -51,156 +74,276 @@ class MockOrchestrator:
         self._tasks: dict[int, TaskRun] = {}
         self._events: list[OrchestratorEvent] = []
         self._subs: list[StateChangeCallback] = []
-        self._runners: dict[int, asyncio.Task] = {}
+        self._runners: dict[int, asyncio.Task[Any]] = {}
+        self._delayed: set[asyncio.Task[Any]] = set()
         self._doom: dict[int, tuple[int, Exception]] = {}
+        self._max_parallelism = 0
 
-    # ---------- управление ----------
     async def start(self) -> None:
+        if self._started:
+            return
         self._started = True
-        self._log("INFO", None, "Оркестратор запущен (mock)")
+        self._log("INFO", None, "MockOrchestrator запущен и готов к диспетчеризации", "STARTUP")
         self._pump()
         self._notify()
 
     async def stop(self) -> None:
         self._started = False
+        for dt in list(self._delayed):
+            dt.cancel()
+        if self._delayed:
+            await asyncio.gather(*self._delayed, return_exceptions=True)
+        self._delayed.clear()
         await self._cancel_runners()
-        self._log("INFO", None, "Оркестратор остановлен (mock)")
+        self._log("INFO", None, "MockOrchestrator остановлен", "SHUTDOWN")
         self._notify()
 
     def set_orchestration_enabled(self, enabled: bool) -> None:
-        self._enabled = enabled
-        self._log("INFO", None, "Режим: " + ("С оркестратором" if enabled else "Без оркестратора (как было)"))
+        self._enabled = bool(enabled)
+        mode_str = "TO-BE (С оркестратором)" if self._enabled else "AS-IS (Без оркестратора)"
+        self._log("INFO" if self._enabled else "WARN", None, f"Переключён режим: {mode_str}", "MODE")
         self._pump()
         self._notify()
 
     def is_orchestration_enabled(self) -> bool:
         return self._enabled
 
-    async def submit(self, request: TaskRequest) -> TaskRun:
-        spec = self._specs.get(request.process_id)
-        if spec is None:
-            raise ValueError(f"Неизвестный процесс: {request.process_id}")
-        self._seq += 1
-        task = TaskRun(
-            task_id=self._seq, process_id=request.process_id, target_date=request.target_date,
-            trigger=request.trigger,
-            priority=request.priority if request.priority is not None else spec.default_priority,
-            status=TaskStatus.QUEUED, progress=0,
-            queued_at=datetime.now() + timedelta(seconds=request.delay_sec),  # delay_sec: отложенная постановка
-        )
-        self._tasks[task.task_id] = task
-        self._log("INFO", task.task_id, f"Заявка {task.process_id} за {task.target_date} ({task.trigger.name})")
-        if request.delay_sec > 0:
-            asyncio.get_running_loop().call_later(request.delay_sec, self._pump)
-        self._pump()
-        self._notify()
-        return copy.copy(task)
-
-    async def submit_batch(self, requests: list[TaskRequest]) -> list[TaskRun]:
-        return [await self.submit(r) for r in requests]
+    def is_paused(self) -> bool:
+        return self._paused
 
     def pause(self) -> None:
         self._paused = True
-        self._log("INFO", None, "Пауза: новые задачи не стартуют")
+        self._log("WARN", None, "Очередь диспетчера поставлена на паузу", "PAUSED")
         self._notify()
 
     def resume(self) -> None:
         self._paused = False
-        self._log("INFO", None, "Продолжение работы")
+        self._log("INFO", None, "Диспетчеризация очереди возобновлена", "RESUMED")
         self._pump()
         self._notify()
 
-    async def reset(self) -> None:
+    async def reset(self, *, clear_storage: bool = False) -> None:
+        _ = clear_storage
+        for dt in list(self._delayed):
+            dt.cancel()
+        self._delayed.clear()
         await self._cancel_runners()
         self._tasks.clear()
         self._events.clear()
         self._doom.clear()
         self._seq = 0
         self._paused = False
-        self._log("INFO", None, "Сброс состояния")
+        self._max_parallelism = 0
+        self._log("INFO", None, "Стенд сброшен: очередь, блокировки и журнал очищены", "RESET")
         self._notify()
 
     def subscribe(self, callback: StateChangeCallback) -> None:
-        self._subs.append(callback)
+        if callback not in self._subs:
+            self._subs.append(callback)
 
-    # ---------- read-only снимки ----------
+    def unsubscribe(self, callback: StateChangeCallback) -> None:
+        if callback in self._subs:
+            self._subs.remove(callback)
+
+    async def submit(self, request: TaskRequest) -> TaskRun:
+        if not self._started:
+            await self.start()
+        spec = self._specs.get(request.process_id)
+        if spec is None:
+            raise ValueError(f"Unknown process: {request.process_id}")
+
+        if request.delay_sec > 0:
+            await asyncio.sleep(request.delay_sec)
+
+        trigger = TriggerType(request.trigger)
+        priority = 1 if trigger == TriggerType.AUTO else (
+            int(request.priority) if request.priority is not None else spec.default_priority
+        )
+        initiated_by = request.initiated_by or (
+            "scheduler_bot" if trigger == TriggerType.AUTO else "analyst_1"
+        )
+        duplicate = self._enabled and any(
+            t.process_id == request.process_id
+            and t.target_date == request.target_date
+            and t.status in (TaskStatus.QUEUED, TaskStatus.RUNNING)
+            for t in self._tasks.values()
+        )
+        self._seq += 1
+        now = datetime.now()
+        status = TaskStatus.DEDUPLICATED if duplicate else TaskStatus.QUEUED
+        task = TaskRun(
+            task_id=self._seq,
+            process_id=request.process_id,
+            target_date=request.target_date,
+            trigger=trigger,
+            priority=priority,
+            status=status,
+            progress=0,
+            queued_at=now,
+            finished_at=now if duplicate else None,
+            initiated_by=initiated_by,
+            session_id=request.session_id,
+            effective_priority=float(priority),
+            orchestration_enabled=self._enabled,
+        )
+        self._tasks[task.task_id] = task
+        self._log(
+            "INFO",
+            task.task_id,
+            f"{status.value}: {task.process_id} ({task.target_date}) от {initiated_by}",
+            status.value,
+        )
+        self._pump()
+        self._notify()
+        return copy.deepcopy(task)
+
+    async def submit_batch(self, requests: list[TaskRequest]) -> list[TaskRun]:
+        if not self._started:
+            await self.start()
+        immediate: list[TaskRun] = []
+        for req in requests:
+            if req.delay_sec and req.delay_sec > 0:
+                dt = asyncio.create_task(self.submit(req))
+                self._delayed.add(dt)
+                dt.add_done_callback(self._delayed.discard)
+            else:
+                immediate.append(await self.submit(req))
+        return immediate
+
+    async def cancel(self, task_id: int) -> bool:
+        task = self._tasks.get(task_id)
+        if task is None or task.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+            return False
+        runner = self._runners.pop(task_id, None)
+        if runner is not None:
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+        task.status = TaskStatus.CANCELLED
+        task.finished_at = datetime.now()
+        task.blocked_by = None
+        task.error_type = "CancelledError"
+        task.error_message = "CancelledError: Cancelled by user"
+        self._log("WARN", task_id, f"CANCELLED: задача #{task_id} отменена пользователем", "CANCELLED")
+        self._pump()
+        self._notify()
+        return True
+
     def get_process_specs(self) -> list[ProcessSpec]:
-        return list(self._specs.values())
+        return copy.deepcopy(list(self._specs.values()))
 
     def get_tasks(self, status: TaskStatus | None = None) -> list[TaskRun]:
-        return [copy.copy(t) for t in self._tasks.values() if status is None or t.status == status]
+        return copy.deepcopy(
+            [t for t in self._tasks.values() if status is None or t.status == status]
+        )
 
     def get_active_locks(self) -> dict[str, list[int]]:
-        """Ключи вида 'Источник@дата' и 'process:ID' (если нет параллельных дат) -> id задач."""
+        if not self._enabled:
+            return {}
         locks: dict[str, list[int]] = {}
         for t in self._running():
             spec = self._specs[t.process_id]
-            for src in (*spec.read_sources, *spec.write_sources):
-                ids = locks.setdefault(f"{src}@{t.target_date}", [])
-                if t.task_id not in ids:
-                    ids.append(t.task_id)
+            for src in spec.write_sources:
+                part = "GLOBAL" if src in GLOBAL_SOURCES else t.target_date
+                locks.setdefault(f"WRITE:SOURCE:{src}:{part}", []).append(t.task_id)
+            for src in spec.read_sources:
+                if src in spec.write_sources:
+                    continue
+                part = "GLOBAL" if src in GLOBAL_SOURCES else t.target_date
+                locks.setdefault(f"READ:SOURCE:{src}:{part}", []).append(t.task_id)
             if not spec.allow_parallel_dates:
-                locks.setdefault(f"process:{t.process_id}", []).append(t.task_id)
+                locks.setdefault(f"WRITE:PROCESS:{t.process_id}:GLOBAL", []).append(t.task_id)
+            if spec.uses_shared_staging and spec.staging_key:
+                locks.setdefault(f"WRITE:STAGING:{spec.staging_key}:GLOBAL", []).append(t.task_id)
         return locks
 
     def get_events(self, limit: int = 100) -> list[OrchestratorEvent]:
-        return list(self._events[-limit:])
+        return copy.deepcopy(self._events[-limit:]) if limit > 0 else []
 
     def get_gantt_data(self) -> list[dict[str, Any]]:
-        """Допущение по формату: start/finish=None, если ещё не начато/не завершено (UI подставляет now)."""
-        now = datetime.now()
-        out = []
-        for t in self._tasks.values():
-            end = t.finished_at or (now if t.started_at else None)
-            out.append({
-                "task_id": t.task_id, "task": f"#{t.task_id} {t.process_id}", "process_id": t.process_id,
-                "target_date": t.target_date, "trigger": t.trigger.name, "status": t.status.name,
-                "queued_at": t.queued_at, "start": t.started_at, "finish": end,
-                "wait_sec": ((t.started_at or now) - t.queued_at).total_seconds() if t.queued_at <= now else 0.0,
-                "run_sec": (end - t.started_at).total_seconds() if t.started_at and end else 0.0,
-            })
-        return out
+        return copy.deepcopy(
+            [
+                {
+                    "task_id": t.task_id,
+                    "process_id": t.process_id,
+                    "target_date": t.target_date,
+                    "trigger": t.trigger.value,
+                    "priority": t.priority,
+                    "status": t.status.value,
+                    "progress": t.progress,
+                    "queued_at": t.queued_at,
+                    "started_at": t.started_at,
+                    "finished_at": t.finished_at,
+                    "blocked_by": t.blocked_by,
+                    "error_message": t.error_message,
+                }
+                for t in self._tasks.values()
+            ]
+        )
 
     def get_metrics(self) -> dict[str, Any]:
-        ts = list(self._tasks.values())
-        done = [t for t in ts if t.status == TaskStatus.COMPLETED and t.started_at and t.finished_at]
-        err = lambda name: sum(1 for t in ts if t.status == TaskStatus.FAILED and (t.error_message or "").startswith(name))
-        starts = [t.queued_at for t in ts]
-        ends = [t.finished_at for t in ts if t.finished_at]
+        tasks = list(self._tasks.values())
+        counts = {s: sum(t.status == s for t in tasks) for s in TaskStatus}
+        completed = counts[TaskStatus.COMPLETED]
+        failed = counts[TaskStatus.FAILED]
+        deduplicated = counts[TaskStatus.DEDUPLICATED]
+        deadlocks = sum(t.error_type == "DeadlockError" for t in tasks)
+        corruptions = sum(t.error_type == "DataCorruptionError" for t in tasks)
+        cross_date = sum(t.error_type == "CrossDateCollisionError" for t in tasks)
+        waits = [(t.started_at - t.queued_at).total_seconds() for t in tasks if t.started_at]
+        runs = [
+            (t.finished_at - t.started_at).total_seconds()
+            for t in tasks
+            if t.started_at and t.finished_at
+        ]
+        finished_total = completed + failed
+        violations = max(failed, deadlocks + corruptions + cross_date)
+        integrity_score = (
+            round(100.0 * max(0, finished_total - violations) / finished_total, 1)
+            if finished_total
+            else 100.0
+        )
         return {
-            "orchestration_enabled": self._enabled, "paused": self._paused, "total": len(ts),
-            "queued": sum(t.status == TaskStatus.QUEUED for t in ts),
-            "running": sum(t.status == TaskStatus.RUNNING for t in ts),
-            "completed": len(done),
-            "failed": sum(t.status == TaskStatus.FAILED for t in ts),
-            "deadlocks": err("DeadlockError"), "data_corruptions": err("DataCorruptionError"),
-            "cross_date_collisions": err("CrossDateCollisionError"),
-            "avg_wait_sec": round(sum((t.started_at - t.queued_at).total_seconds() for t in done) / len(done), 2) if done else 0.0,
-            "avg_run_sec": round(sum((t.finished_at - t.started_at).total_seconds() for t in done) / len(done), 2) if done else 0.0,
-            "makespan_sec": round((max(ends) - min(starts)).total_seconds(), 2) if ends and starts else 0.0,
+            "total": len(tasks),
+            "queued": counts[TaskStatus.QUEUED],
+            "running": counts[TaskStatus.RUNNING],
+            "completed": completed,
+            "failed": failed,
+            "cancelled": counts[TaskStatus.CANCELLED],
+            "deduplicated": deduplicated,
+            "deduplicated_count": deduplicated,
+            "deadlocks": deadlocks,
+            "corruptions": corruptions,
+            "cross_date_collisions": cross_date,
+            "avg_wait_sec": sum(waits) / len(waits) if waits else 0.0,
+            "avg_run_sec": sum(runs) / len(runs) if runs else 0.0,
+            "success_rate": 100.0 * completed / finished_total if finished_total else 100.0,
+            "integrity_score": integrity_score,
+            "active_locks": len(self.get_active_locks()),
+            "max_parallelism": self._max_parallelism,
+            "paused": self._paused,
+            "orchestration_enabled": self._enabled,
         }
 
-    # ---------- внутренности ----------
     def _running(self) -> list[TaskRun]:
         return [t for t in self._tasks.values() if t.status == TaskStatus.RUNNING]
 
     def _conflict(self, a: TaskRun, b: TaskRun) -> str | None:
-        """'process:ID' или имя источника, если задачи конфликтуют (READ/WRITE + даты + allow_parallel_dates)."""
         sa, sb = self._specs[a.process_id], self._specs[b.process_id]
         if a.process_id == b.process_id and not sa.allow_parallel_dates:
-            return f"process:{a.process_id}"
+            return f"WRITE:STAGING:{sa.staging_key or a.process_id}:GLOBAL"
+        if SLA in sa.write_sources and SLA in (*sb.read_sources, *sb.write_sources):
+            return f"WRITE:SOURCE:{SLA}:GLOBAL"
+        if SLA in sb.write_sources and SLA in (*sa.read_sources, *sa.write_sources):
+            return f"WRITE:SOURCE:{SLA}:GLOBAL"
         if a.target_date != b.target_date:
             return None
         for src in (*sa.write_sources, *sb.write_sources):
-            if (src in sa.write_sources and src in (*sb.read_sources, *sb.write_sources)) or \
-               (src in sb.write_sources and src in (*sa.read_sources, *sa.write_sources)):
-                return src
-        return None
-
-    def _first_conflict(self, t: TaskRun, running: list[TaskRun]) -> tuple[TaskRun, str] | None:
-        for o in running:
-            if (r := self._conflict(t, o)):
-                return o, r
+            if src == SLA:
+                continue
+            if (src in sa.write_sources and src in (*sb.read_sources, *sb.write_sources)) or (
+                src in sb.write_sources and src in (*sa.read_sources, *sa.write_sources)
+            ):
+                return f"WRITE:SOURCE:{src}:{a.target_date}"
         return None
 
     def _pump(self) -> None:
@@ -208,40 +351,56 @@ class MockOrchestrator:
             return
         now = datetime.now()
         running = self._running()
-        queued = sorted((t for t in self._tasks.values() if t.status == TaskStatus.QUEUED and t.queued_at <= now),
-                        key=lambda t: (t.priority, t.queued_at, t.task_id))  # допущение: меньше число = выше приоритет
+        queued = sorted(
+            (t for t in self._tasks.values() if t.status == TaskStatus.QUEUED),
+            key=lambda t: (t.effective_priority or float(t.priority), t.queued_at, t.task_id),
+        )
         changed = False
         for t in queued:
-            hit = self._first_conflict(t, running)
+            age = int((now - t.queued_at).total_seconds() / 15.0) if t.trigger == TriggerType.MANUAL else 0
+            t.effective_priority = float(t.priority - age)
+            hit = next(((o, r) for o in running if (r := self._conflict(t, o))), None)
             if hit and self._enabled:
-                o, r = hit
-                why = (f"Ожидает завершения {t.process_id} за другую дату (задача #{o.task_id}, {o.target_date})"
-                       if r.startswith("process:")
-                       else f"Ожидает освобождения витрины {r} ({t.target_date}), занятой задачей #{o.task_id}")
+                owner, res = hit
+                why = f"Ожидает {res} (занят #{owner.task_id} {owner.process_id})"
                 if t.blocked_by != why:
-                    t.blocked_by, changed = why, True
+                    t.blocked_by = why
+                    self._log("WARN", t.task_id, why, "WAIT_CONFLICT")
+                    changed = True
                 continue
-            if hit:  # режим «без оркестратора»: стартуем вслепую, задача упадёт на 60%
+            if hit and not self._enabled:
                 self._doom[t.task_id] = (60, self._error_for(hit[1], t, hit[0]))
-            t.status, t.started_at, t.blocked_by = TaskStatus.RUNNING, now, None
+            t.status = TaskStatus.RUNNING
+            t.started_at = now
+            t.blocked_by = None
             running.append(t)
+            self._max_parallelism = max(self._max_parallelism, len(running))
             self._runners[t.task_id] = asyncio.create_task(self._execute(t))
-            self._log("INFO", t.task_id, f"Старт {t.process_id} за {t.target_date}")
+            self._log("INFO", t.task_id, f"RUNNING: #{t.task_id} {t.process_id} ({t.target_date})", "RUNNING")
             changed = True
         if changed:
             self._notify()
 
-    def _error_for(self, reason: str, a: TaskRun, b: TaskRun) -> Exception:
-        if reason.startswith("process:"):
-            return CrossDateCollisionError(f"staging-буфер {a.process_id} перемешан датами {b.target_date}/{a.target_date}")
-        if {a.process_id, b.process_id} == {STOCKOUT, DELAY} and reason in (WAREHOUSE, TRANSIT):
-            return DeadlockError(f"AB-BA между #{a.task_id} и #{b.task_id}")
-        return DataCorruptionError(f"Lost Update на {reason}: #{a.task_id} и #{b.task_id}")
+    @staticmethod
+    def _error_for(reason: str, a: TaskRun, b: TaskRun) -> Exception:
+        if "STAGING" in reason or (a.process_id == CARRIER and b.process_id == CARRIER):
+            return CrossDateCollisionError(
+                f"Коллизия staging-буфера {a.process_id} между {b.target_date} и {a.target_date}"
+            )
+        if {a.process_id, b.process_id} == {STOCKOUT, DELAY} and any(
+            s in reason for s in (WAREHOUSE, TRANSIT)
+        ):
+            return DeadlockError(
+                f"AB-BA Deadlock между #{a.task_id} {a.process_id} и #{b.task_id} {b.process_id}"
+            )
+        return DataCorruptionError(
+            f"Lost Update / грязное чтение на {reason} (конфликт с #{b.task_id} {b.process_id})"
+        )
 
     async def _execute(self, task: TaskRun) -> None:
         doom = self._doom.pop(task.task_id, None)
 
-        async def on_progress(tid: int, pct: int) -> None:
+        async def on_progress(_tid: int, pct: int) -> None:
             task.progress = pct
             if doom and pct >= doom[0]:
                 raise doom[1]
@@ -249,15 +408,19 @@ class MockOrchestrator:
 
         try:
             task.result = await self._services[task.process_id].run(
-                task.task_id, task.target_date, task.trigger, on_progress)
+                task.task_id, task.target_date, task.trigger, on_progress
+            )
+            task.progress = 100
             task.status = TaskStatus.COMPLETED
-            self._log("INFO", task.task_id, "Завершено")
+            self._log("INFO", task.task_id, f"COMPLETED: #{task.task_id} {task.process_id}", "COMPLETED")
         except asyncio.CancelledError:
             task.status = TaskStatus.CANCELLED
             raise
-        except Exception as e:  # noqa: BLE001
-            task.status, task.error_message = TaskStatus.FAILED, f"{type(e).__name__}: {e}"
-            self._log("ERROR", task.task_id, task.error_message)
+        except Exception as exc:
+            task.status = TaskStatus.FAILED
+            task.error_type = type(exc).__name__
+            task.error_message = f"{task.error_type}: {exc}"
+            self._log("ERROR", task.task_id, task.error_message, "FAILED")
         finally:
             task.finished_at = datetime.now()
             self._runners.pop(task.task_id, None)
@@ -268,14 +431,80 @@ class MockOrchestrator:
         runners = list(self._runners.values())
         for r in runners:
             r.cancel()
-        await asyncio.gather(*runners, return_exceptions=True)
+        if runners:
+            await asyncio.gather(*runners, return_exceptions=True)
         self._runners.clear()
 
-    def _log(self, level: str, task_id: int | None, message: str) -> None:
-        self._events.append(OrchestratorEvent(timestamp=datetime.now(), level=level, task_id=task_id, message=message))
+    def _log(self, level: str, task_id: int | None, message: str, code: str = "GENERAL") -> None:
+        self._events.append(
+            OrchestratorEvent(
+                timestamp=datetime.now(),
+                level=level,
+                task_id=task_id,
+                message=message,
+                event_code=code,
+            )
+        )
 
     def _notify(self) -> None:
-        for cb in self._subs:
-            res = cb()
-            if inspect.isawaitable(res):
-                asyncio.ensure_future(res)
+        for cb in tuple(self._subs):
+            try:
+                res = cb()
+                if inspect.isawaitable(res):
+                    asyncio.ensure_future(res)
+            except Exception:
+                continue
+
+
+class MockReglamentScheduler:
+    """Автономный планировщик регламента (совместимый с ReglamentScheduler)."""
+
+    def __init__(self, orchestrator: Any, interval: float = 15.0) -> None:
+        self._orchestrator = orchestrator
+        self._interval = max(1.0, float(interval))
+        self._enabled = False
+        self._idx = 0
+        self._task: asyncio.Task[None] | None = None
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def get_interval(self) -> float:
+        return self._interval
+
+    def set_interval(self, seconds: float) -> None:
+        self._interval = max(1.0, float(seconds))
+
+    def set_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._enabled:
+            return
+        self._enabled = enabled
+        if enabled:
+            self._task = asyncio.create_task(self._loop())
+        elif self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+    async def stop(self) -> None:
+        self.set_enabled(False)
+
+    async def _loop(self) -> None:
+        cycle = (STOCKOUT, DELAY, SPOILAGE, CARRIER)
+        target_day = date(2026, 11, 20).isoformat()
+        try:
+            while self._enabled:
+                pid = cycle[self._idx % len(cycle)]
+                self._idx += 1
+                await self._orchestrator.submit(
+                    TaskRequest(
+                        process_id=pid,
+                        target_date=target_day,
+                        trigger=TriggerType.AUTO,
+                        priority=1,
+                        initiated_by="scheduler_bot",
+                    )
+                )
+                await asyncio.sleep(self._interval)
+        except asyncio.CancelledError:
+            return

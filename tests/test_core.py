@@ -7,8 +7,16 @@ from tempfile import TemporaryDirectory
 
 from core.lock_manager import LockManager
 from core.models import (
-    AccessMode, LockScope, ProcessSpec, ResourceRule, TaskRequest, TaskRun,
-    TaskStatus, TriggerType, from_utc, to_utc,
+    AccessMode,
+    LockScope,
+    ProcessSpec,
+    ResourceRule,
+    TaskRequest,
+    TaskRun,
+    TaskStatus,
+    TriggerType,
+    from_utc,
+    to_utc,
 )
 from core.orchestrator import Orchestrator
 from core.scheduler import ReglamentScheduler

@@ -1,13 +1,32 @@
-"""Live Plotly Gantt timeline component showing parallel vs queued execution."""
+"""Live matplotlib Gantt chart (FigureCanvasTkAgg) seamlessly styled for #161B22 Dark Mode."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import time
+from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
-from nicegui import ui
-import plotly.graph_objects as go
+from matplotlib.figure import Figure
+from matplotlib.patches import Patch
 
+from ui.assets.theme import (
+    BG_ELEVATED,
+    BG_PANEL,
+    BORDER,
+    CORNER_RADIUS,
+    STATUS_CANCELLED,
+    STATUS_COLORS,
+    STATUS_COMPLETED,
+    STATUS_DEDUPLICATED,
+    STATUS_FAILED,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
+    font_mono,
+    font_ui,
+)
 from ui.contracts import OrchestratorProtocol, status_key, trigger_key
 
 
@@ -16,16 +35,19 @@ def _parse_dt(value: Any) -> datetime | None:
         return None
     if isinstance(value, datetime):
         return value
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value))
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value)
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
         except ValueError:
             return None
     return None
 
 
-def _normalize_gantt_rows(orchestrator: OrchestratorProtocol) -> list[dict[str, Any]]:
-    """Read get_gantt_data() with resilient normalization and fallback to get_tasks()."""
+def normalize_gantt_rows(orchestrator: OrchestratorProtocol) -> list[dict[str, Any]]:
+    """Read get_gantt_data() with fallback to get_tasks()."""
     raw_rows = orchestrator.get_gantt_data() or []
     normalized: list[dict[str, Any]] = []
 
@@ -33,10 +55,10 @@ def _normalize_gantt_rows(orchestrator: OrchestratorProtocol) -> list[dict[str, 
         if not isinstance(row, dict):
             continue
         task_id = row.get("task_id") or row.get("id")
-        process_id = row.get("process_id") or row.get("process") or row.get("task")
+        process_id = row.get("process_id") or row.get("process")
         queued_at = _parse_dt(row.get("queued_at"))
         started_at = _parse_dt(row.get("started_at") or row.get("start"))
-        finished_at = _parse_dt(row.get("finished_at") or row.get("finish") or row.get("end"))
+        finished_at = _parse_dt(row.get("finished_at") or row.get("finish"))
         if task_id is None or process_id is None or (queued_at is None and started_at is None):
             continue
         normalized.append(
@@ -44,15 +66,13 @@ def _normalize_gantt_rows(orchestrator: OrchestratorProtocol) -> list[dict[str, 
                 "task_id": int(task_id),
                 "process_id": str(process_id),
                 "target_date": str(row.get("target_date") or ""),
-                "trigger": trigger_key(row.get("trigger", "MANUAL")),
-                "priority": row.get("priority", 2),
+                "trigger": trigger_key(row.get("trigger") or row.get("trigger_type") or "MANUAL"),
+                "priority": int(row.get("priority", 2) or 2),
                 "status": status_key(row.get("status", "RUNNING")),
                 "progress": int(row.get("progress", 0) or 0),
                 "queued_at": queued_at or started_at,
                 "started_at": started_at,
                 "finished_at": finished_at,
-                "blocked_by": row.get("blocked_by"),
-                "error_message": row.get("error_message"),
             }
         )
 
@@ -60,9 +80,7 @@ def _normalize_gantt_rows(orchestrator: OrchestratorProtocol) -> list[dict[str, 
         normalized.sort(key=lambda r: r["task_id"])
         return normalized
 
-    # Fallback directly to canonical TaskRun list
-    tasks = orchestrator.get_tasks()
-    tasks.sort(key=lambda t: t.task_id)
+    tasks = sorted(orchestrator.get_tasks(), key=lambda t: t.task_id)
     for t in tasks:
         normalized.append(
             {
@@ -76,8 +94,6 @@ def _normalize_gantt_rows(orchestrator: OrchestratorProtocol) -> list[dict[str, 
                 "queued_at": t.queued_at,
                 "started_at": t.started_at,
                 "finished_at": t.finished_at,
-                "blocked_by": t.blocked_by,
-                "error_message": t.error_message,
             }
         )
     return normalized
@@ -86,287 +102,305 @@ def _normalize_gantt_rows(orchestrator: OrchestratorProtocol) -> list[dict[str, 
 def build_gantt_figure(
     rows: list[dict[str, Any]],
     *,
-    show_wait: bool = True,
-    is_dark: bool = False,
     now: datetime | None = None,
-) -> go.Figure:
-    """Build a pure-Plotly (no pandas) Gantt chart Figure with wait & execution segments."""
+    selected_task_id: int | None = None,
+    fig: Figure | None = None,
+) -> tuple[Figure, list[int]]:
+    """Render composite horizontal Gantt bars onto a matplotlib Figure (#161B22 dark surface).
+
+    Returns (figure, visible_task_ids_top_to_bottom).
+    """
     now = now or datetime.now()
-    text_color = "#e2e8f0" if is_dark else "#1e293b"
-    muted_color = "#94a3b8" if is_dark else "#64748b"
-    grid_color = "rgba(148, 163, 184, 0.16)" if is_dark else "rgba(148, 163, 184, 0.28)"
-
-    fig = go.Figure()
-
-    if not rows:
-        fig.add_annotation(
-            text="Запустите демо-сценарий или ручную задачу — таймлайн появится в реальном времени",
-            xref="paper",
-            yref="paper",
-            x=0.5,
-            y=0.5,
-            showarrow=False,
-            font={"size": 13, "color": muted_color},
-        )
-        fig.update_layout(
-            height=260,
-            margin={"l": 24, "r": 24, "t": 20, "b": 24},
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            xaxis={"visible": False},
-            yaxis={"visible": False},
-        )
-        return fig
-
-    # Keep latest 25 tasks visible so the Gantt stays clean during heavy stress tests
-    visible_rows = rows[-25:]
-    labels = [
-        f"#{r['task_id']} {r['process_id']} ({r['target_date']}) [{r['trigger']}]"
-        for r in visible_rows
-    ]
-
-    # Collect per-phase trace arrays
-    wait_y, wait_base, wait_dur, wait_hover = [], [], [], []
-    status_buckets: dict[str, tuple[list[str], list[str], list[float], list[str], list[str]]] = {
-        "RUNNING": ([], [], [], [], []),
-        "COMPLETED": ([], [], [], [], []),
-        "FAILED": ([], [], [], [], []),
-        "CANCELLED": ([], [], [], [], []),
-    }
-
-    min_ts: datetime | None = None
-    max_ts: datetime | None = None
-    has_active = False
-
-    for r, lbl in zip(visible_rows, labels):
-        st = r["status"]
-        q_at: datetime = r["queued_at"]
-        s_at: datetime | None = r["started_at"]
-        f_at: datetime | None = r["finished_at"]
-
-        if st in ("RUNNING", "QUEUED"):
-            has_active = True
-
-        if min_ts is None or q_at < min_ts:
-            min_ts = q_at
-
-        # Wait segment (queued -> started or now)
-        wait_end = s_at if s_at is not None else now
-        wait_ms = max(0.0, (wait_end - q_at).total_seconds() * 1000.0)
-        if show_wait and (wait_ms >= 80.0 or st == "QUEUED"):
-            display_wait_ms = max(wait_ms, 180.0)
-            wait_y.append(lbl)
-            wait_base.append(q_at.isoformat())
-            wait_dur.append(display_wait_ms)
-            reason = r.get("blocked_by") or "Ожидание планировщика"
-            wait_hover.append(
-                f"<b>#{r['task_id']} {r['process_id']}</b><br>"
-                f"Фаза: <b>Ожидание (QUEUED)</b><br>"
-                f"Дата расчёта: {r['target_date']} | {r['trigger']} | P{r['priority']}<br>"
-                f"Ожидание: {wait_ms / 1000.0:.2f}с<br>"
-                f"Причина: {reason}"
-            )
-            if max_ts is None or wait_end > max_ts:
-                max_ts = wait_end
-
-        # Execution segment (started -> finished or now)
-        if s_at is not None:
-            run_end = f_at if f_at is not None else now
-            run_ms = max(160.0, (run_end - s_at).total_seconds() * 1000.0)
-            bucket_key = st if st in status_buckets else "COMPLETED"
-            by, bbase, bdur, btxt, bhover = status_buckets[bucket_key]
-            by.append(lbl)
-            bbase.append(s_at.isoformat())
-            bdur.append(run_ms)
-            if st == "RUNNING":
-                btxt.append(f"{r['progress']}%")
-            elif st == "FAILED":
-                btxt.append("СБОЙ")
-            elif st == "CANCELLED":
-                btxt.append("ОТМ.")
-            else:
-                btxt.append(f"{run_ms / 1000.0:.1f}с")
-
-            err_line = f"<br><b>Ошибка:</b> {r['error_message']}" if r.get("error_message") else ""
-            bhover.append(
-                f"<b>#{r['task_id']} {r['process_id']}</b><br>"
-                f"Статус: <b>{st}</b><br>"
-                f"Дата расчёта: {r['target_date']} | {r['trigger']} | P{r['priority']}<br>"
-                f"Ожидание: {wait_ms / 1000.0:.2f}с | Выполнение: {run_ms / 1000.0:.2f}с"
-                f"{err_line}"
-            )
-            if max_ts is None or run_end > max_ts:
-                max_ts = run_end
-
-    if wait_y:
-        fig.add_trace(
-            go.Bar(
-                name="Ожидание (QUEUED)",
-                orientation="h",
-                y=wait_y,
-                base=wait_base,
-                x=wait_dur,
-                marker={
-                    "color": "rgba(245, 158, 11, 0.32)",
-                    "line": {"color": "#d97706", "width": 1.2},
-                },
-                hovertext=wait_hover,
-                hovertemplate="%{hovertext}<extra></extra>",
-                width=0.58,
-            )
-        )
-
-    style_map = {
-        "RUNNING": ("Выполняется (RUNNING)", "#2563eb", "#1d4ed8"),
-        "COMPLETED": ("Завершено (COMPLETED)", "#10b981", "#047857"),
-        "FAILED": ("Сбой (FAILED)", "#ef4444", "#b91c1c"),
-        "CANCELLED": ("Отменено (CANCELLED)", "#94a3b8", "#64748b"),
-    }
-
-    for st_key, (trace_name, fill_color, line_color) in style_map.items():
-        by, bbase, bdur, btxt, bhover = status_buckets[st_key]
-        if not by:
-            continue
-        fig.add_trace(
-            go.Bar(
-                name=trace_name,
-                orientation="h",
-                y=by,
-                base=bbase,
-                x=bdur,
-                text=btxt,
-                textposition="inside",
-                insidetextanchor="middle",
-                textfont={"color": "#ffffff", "size": 11},
-                marker={
-                    "color": fill_color,
-                    "line": {"color": line_color, "width": 1},
-                },
-                hovertext=bhover,
-                hovertemplate="%{hovertext}<extra></extra>",
-                width=0.58,
-            )
-        )
-
-    if min_ts is not None and max_ts is not None:
-        span_sec = max(4.0, (max_ts - min_ts).total_seconds())
-        pad = timedelta(seconds=max(0.5, span_sec * 0.06))
-        x_range = [(min_ts - timedelta(seconds=0.3)).isoformat(), (max_ts + pad).isoformat()]
+    if fig is None:
+        fig = Figure(figsize=(8.0, 2.8), dpi=100, facecolor=BG_PANEL)
     else:
-        x_range = None
+        fig.clear()
+        fig.patch.set_facecolor(BG_PANEL)
 
-    if has_active:
-        fig.add_vline(
-            x=now.isoformat(),
-            line_width=1.5,
-            line_dash="dot",
-            line_color="#6366f1",
+    ax = fig.add_subplot(111)
+    ax.set_facecolor(BG_PANEL)
+
+    visible = rows[-14:]
+    if not visible:
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.text(
+            0.5,
+            0.5,
+            "Таймлайн пуст — запустите сценарий проверки или ручную задачу",
+            ha="center",
+            va="center",
+            color=TEXT_MUTED,
+            fontsize=9.5,
+            transform=ax.transAxes,
         )
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.08)
+        return fig, []
 
-    chart_height = max(290, min(620, 115 + 34 * len(visible_rows)))
+    t0 = min(r["queued_at"] for r in visible)
+    y_positions = list(range(len(visible)))
+    y_labels: list[str] = []
+    visible_ids: list[int] = []
+    max_end = 1.0
 
-    fig.update_layout(
-        barmode="overlay",
-        height=chart_height,
-        margin={"l": 10, "r": 20, "t": 36, "b": 34},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font={"color": text_color, "size": 12},
-        legend={
-            "orientation": "h",
-            "yanchor": "bottom",
-            "y": 1.02,
-            "xanchor": "left",
-            "x": 0,
-            "font": {"size": 11},
-        },
-        xaxis={
-            "type": "date",
-            "range": x_range,
-            "tickformat": "%H:%M:%S",
-            "gridcolor": grid_color,
-            "showline": True,
-            "linecolor": grid_color,
-            "title": {"text": "Время выполнения (параллельные полосы = одновременная работа)", "font": {"size": 11, "color": muted_color}},
-        },
-        yaxis={
-            "categoryorder": "array",
-            "categoryarray": list(reversed(labels)),
-            "automargin": True,
-            "gridcolor": grid_color,
-            "tickfont": {"size": 11},
-        },
+    for idx, r in enumerate(visible):
+        tid = int(r["task_id"])
+        visible_ids.append(tid)
+        st = status_key(r["status"])
+        short_date = str(r["target_date"])[-5:]
+        prefix = "▸ " if tid == selected_task_id else ""
+        y_labels.append(f"{prefix}#{tid} {r['process_id']} ({short_date})")
+
+        q_rel = max(0.0, (r["queued_at"] - t0).total_seconds())
+        s_dt: datetime | None = r.get("started_at")
+        f_dt: datetime | None = r.get("finished_at")
+
+        if st == "DEDUPLICATED":
+            # Instant deduplicated marker bar
+            ax.barh(
+                idx,
+                0.12,
+                left=q_rel,
+                height=0.56,
+                color=STATUS_DEDUPLICATED,
+                edgecolor=STATUS_DEDUPLICATED,
+                linewidth=0.9,
+            )
+            ax.text(
+                q_rel + 0.16,
+                idx,
+                "DEDUP (0.0s)",
+                va="center",
+                ha="left",
+                color=STATUS_DEDUPLICATED,
+                fontsize=7.5,
+                family="monospace",
+            )
+            max_end = max(max_end, q_rel + 0.9)
+            continue
+
+        s_rel = max(q_rel, ((s_dt or now) - t0).total_seconds())
+        wait_dur = max(0.0, s_rel - q_rel)
+
+        # 1. Pale amber wait segment (queued_at -> started_at)
+        if wait_dur >= 0.03 or st == "QUEUED":
+            draw_wait = max(wait_dur, 0.08)
+            ax.barh(
+                idx,
+                draw_wait,
+                left=q_rel,
+                height=0.54,
+                color=STATUS_QUEUED,
+                alpha=0.34,
+                edgecolor=STATUS_QUEUED,
+                linewidth=0.9,
+            )
+            if st == "QUEUED":
+                ax.text(
+                    q_rel + draw_wait + 0.08,
+                    idx,
+                    f"wait {wait_dur:.1f}s",
+                    va="center",
+                    ha="left",
+                    color=STATUS_QUEUED,
+                    fontsize=7.5,
+                    family="monospace",
+                )
+            max_end = max(max_end, q_rel + draw_wait + 0.6)
+
+        # 2. Active execution segment (started_at -> finished_at / now)
+        if s_dt is not None:
+            f_rel = max(s_rel, ((f_dt or now) - t0).total_seconds())
+            exec_dur = max(0.08, f_rel - s_rel)
+            bar_color = STATUS_COLORS.get(st, STATUS_RUNNING)
+            edge_color = "#FFFFFF" if tid == selected_task_id else bar_color
+
+            ax.barh(
+                idx,
+                exec_dur,
+                left=s_rel,
+                height=0.58,
+                color=bar_color,
+                alpha=0.92,
+                edgecolor=edge_color,
+                linewidth=1.2 if tid == selected_task_id else 0.7,
+            )
+
+            dur_label = (
+                f"{exec_dur:.1f}s"
+                if wait_dur < 0.15
+                else f"{exec_dur:.1f}s (w:{wait_dur:.1f}s)"
+            )
+            if exec_dur >= max_end * 0.18 and exec_dur >= 0.9:
+                ax.text(
+                    s_rel + exec_dur / 2.0,
+                    idx,
+                    f"{exec_dur:.1f}s",
+                    va="center",
+                    ha="center",
+                    color="#FFFFFF",
+                    fontsize=7.5,
+                    weight="bold",
+                    family="monospace",
+                )
+            else:
+                ax.text(
+                    s_rel + exec_dur + 0.08,
+                    idx,
+                    dur_label,
+                    va="center",
+                    ha="left",
+                    color=TEXT_PRIMARY if st != "FAILED" else STATUS_FAILED,
+                    fontsize=7.5,
+                    family="monospace",
+                )
+            max_end = max(max_end, s_rel + exec_dur + 1.1)
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(y_labels, fontsize=9.0, color=TEXT_PRIMARY, family="monospace")
+    ax.invert_yaxis()
+    ax.set_xlim(0.0, max(4.0, max_end * 1.06))
+    ax.set_xlabel("Время от начала волны (сек)", fontsize=9.0, color=TEXT_MUTED, labelpad=4)
+    ax.tick_params(axis="x", colors=TEXT_MUTED, labelsize=8.5)
+    ax.tick_params(axis="y", length=0, pad=5)
+    ax.grid(axis="x", color=BORDER, linestyle="--", linewidth=0.6, alpha=0.75)
+    ax.set_axisbelow(True)
+
+    for name, spine in ax.spines.items():
+        if name in ("top", "right"):
+            spine.set_visible(False)
+        else:
+            spine.set_color(BORDER)
+            spine.set_linewidth(0.8)
+
+    legend_handles = [
+        Patch(facecolor=STATUS_QUEUED, edgecolor=STATUS_QUEUED, alpha=0.45, label="Ожидание"),
+        Patch(facecolor=STATUS_RUNNING, label="RUNNING"),
+        Patch(facecolor=STATUS_COMPLETED, label="COMPLETED"),
+        Patch(facecolor=STATUS_FAILED, label="FAILED / DEADLOCK"),
+        Patch(facecolor=STATUS_DEDUPLICATED, label="DEDUP"),
+        Patch(facecolor=STATUS_CANCELLED, label="CANCELLED"),
+    ]
+    leg = ax.legend(
+        handles=legend_handles,
+        loc="upper right",
+        ncol=6,
+        frameon=True,
+        facecolor=BG_ELEVATED,
+        edgecolor=BORDER,
+        fontsize=7.0,
+        handlelength=1.0,
+        handletextpad=0.4,
+        columnspacing=0.9,
     )
-    return fig
+    for txt in leg.get_texts():
+        txt.set_color(TEXT_MUTED)
+
+    fig.subplots_adjust(left=0.25, right=0.985, top=0.93, bottom=0.17)
+    return fig, visible_ids
 
 
 class GanttChartPanel:
-    """NiceGUI wrapper hosting a live-updating Plotly Gantt timeline."""
+    """Bottom section of Dispatcher tab: seamless matplotlib FigureCanvasTkAgg Gantt chart."""
 
-    def __init__(self, orchestrator: OrchestratorProtocol) -> None:
+    def __init__(
+        self,
+        parent: Any,
+        orchestrator: OrchestratorProtocol,
+        on_select_task: Callable[[int], None] | None = None,
+    ) -> None:
+        import customtkinter as ctk
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
         self._orchestrator = orchestrator
-        self._show_wait: bool = True
-        self._is_dark: bool = False
-        self._plot: Any = None
-        self._summary_lbl: Any = None
+        self._on_select_task = on_select_task
+        self._selected_task_id: int | None = None
+        self._visible_ids: list[int] = []
         self._last_fp: Any = None
+        self._last_draw_mono: float = 0.0
 
-    def set_dark(self, is_dark: bool) -> None:
-        if self._is_dark != is_dark:
-            self._is_dark = is_dark
+        self.frame = ctk.CTkFrame(
+            parent,
+            fg_color=BG_PANEL,
+            corner_radius=CORNER_RADIUS,
+            border_width=1,
+            border_color=BORDER,
+        )
+        self.frame.grid_columnconfigure(0, weight=1)
+        self.frame.grid_rowconfigure(1, weight=1)
+
+        hdr = ctk.CTkFrame(self.frame, height=26, fg_color=BG_ELEVATED, corner_radius=5)
+        hdr.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        hdr.grid_propagate(False)
+
+        ctk.CTkLabel(
+            hdr,
+            text="ТАЙМЛАЙН ВЫПОЛНЕНИЯ (GANTT · ОЖИДАНИЕ VS ВЫПОЛНЕНИЕ)",
+            font=font_ui(10, "bold"),
+            text_color=TEXT_PRIMARY,
+        ).pack(side="left", padx=8)
+
+        self._summary_lbl = ctk.CTkLabel(
+            hdr,
+            text="0 задач",
+            font=font_mono(9),
+            text_color=TEXT_MUTED,
+        )
+        self._summary_lbl.pack(side="right", padx=8)
+
+        self._fig = Figure(figsize=(8.0, 2.7), dpi=100, facecolor=BG_PANEL)
+        self._canvas = FigureCanvasTkAgg(self._fig, master=self.frame)
+        canvas_widget = self._canvas.get_tk_widget()
+        canvas_widget.configure(bg=BG_PANEL, highlightthickness=0, bd=0)
+        canvas_widget.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+
+        self._canvas.mpl_connect("button_press_event", self._handle_chart_click)
+        self.refresh(force=True)
+
+    def set_selected_task(self, task_id: int | None) -> None:
+        if self._selected_task_id != task_id:
+            self._selected_task_id = task_id
             self.refresh(force=True)
 
-    def build(self) -> None:
-        with ui.column().classes("ro-card p-4 w-full gap-2"):
-            with ui.row().classes("w-full items-center justify-between flex-wrap gap-2"):
-                with ui.row().classes("items-center gap-2"):
-                    ui.icon("view_timeline", size="sm").classes("text-indigo-600")
-                    ui.label("Таймлайн выполнения (Диаграмма Ганта)").classes("text-base font-semibold")
-                    self._summary_lbl = ui.label("").classes("text-xs text-slate-500")
-
-                ui.switch(
-                    "Показывать ожидание в очереди",
-                    value=self._show_wait,
-                    on_change=self._toggle_wait,
-                ).props("dense color=amber-8")
-
-            initial_fig = build_gantt_figure([], show_wait=self._show_wait, is_dark=self._is_dark)
-            self._plot = ui.plotly(initial_fig).classes("w-full")
-
-        self.refresh(force=True)
-
-    def _toggle_wait(self, event: Any) -> None:
-        self._show_wait = bool(event.value)
-        self.refresh(force=True)
+    def _handle_chart_click(self, event: Any) -> None:
+        if self._on_select_task is None or event.ydata is None or not self._visible_ids:
+            return
+        idx = int(round(float(event.ydata)))
+        if 0 <= idx < len(self._visible_ids):
+            self._on_select_task(self._visible_ids[idx])
 
     def refresh(self, *, force: bool = False) -> None:
-        if self._plot is None:
+        mono = time.monotonic()
+        if not force and (mono - self._last_draw_mono) < 0.30:
             return
-        rows = _normalize_gantt_rows(self._orchestrator)
+
+        rows = normalize_gantt_rows(self._orchestrator)
         has_active = any(r["status"] in ("RUNNING", "QUEUED") for r in rows)
         now = datetime.now()
+        active_bucket = int(mono / 0.30) if has_active else 0
 
-        # Advance timeline smoothly every ~0.5s while tasks are active; static once idle
-        clock_bucket = int(now.timestamp() * 2) if has_active else 0
         fp = (
-            self._show_wait,
-            self._is_dark,
-            clock_bucket,
+            self._selected_task_id,
+            active_bucket,
             tuple(
                 (r["task_id"], r["status"], r["progress"], r["started_at"], r["finished_at"])
-                for r in rows[-25:]
+                for r in rows[-14:]
             ),
         )
         if not force and fp == self._last_fp:
             return
+
         self._last_fp = fp
-
-        if self._summary_lbl is not None:
-            if rows:
-                shown = min(len(rows), 25)
-                self._summary_lbl.text = f"Отображено задач: {shown} из {len(rows)}"
-            else:
-                self._summary_lbl.text = "Ожидание запусков"
-
-        fig = build_gantt_figure(rows, show_wait=self._show_wait, is_dark=self._is_dark, now=now)
-        self._plot.update_figure(fig)
+        self._last_draw_mono = mono
+        self._summary_lbl.configure(
+            text=f"показано {min(len(rows), 14)} из {len(rows)} задач"
+        )
+        _, self._visible_ids = build_gantt_figure(
+            rows,
+            now=now,
+            selected_task_id=self._selected_task_id,
+            fig=self._fig,
+        )
+        self._canvas.draw_idle()

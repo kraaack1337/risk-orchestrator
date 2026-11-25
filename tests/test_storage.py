@@ -3,8 +3,28 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 
-import pytest
+try:
+    import pytest
+except ImportError:  # pragma: no cover - fallback when running without pytest binary
+    class _PytestFallback:
+        @staticmethod
+        def fixture(*_args, **_kwargs):
+            def _decorator(fn):
+                return fn
+            return _decorator
+
+        @staticmethod
+        @contextmanager
+        def raises(exc_type):
+            try:
+                yield
+            except exc_type:
+                return
+            raise AssertionError(f"Expected {exc_type.__name__} to be raised")
+
+    pytest = _PytestFallback()  # type: ignore[assignment]
 
 from core.storage import Storage
 

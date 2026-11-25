@@ -16,8 +16,16 @@ from pathlib import Path
 from typing import Any
 
 from core.models import (
-    AccessMode, LockScope, ProcessSpec, ResourceRule, TaskRun, TaskStatus,
-    TriggerType, from_utc, to_utc,
+    AccessMode,
+    LockScope,
+    OrchestratorEvent,
+    ProcessSpec,
+    ResourceRule,
+    TaskRun,
+    TaskStatus,
+    TriggerType,
+    from_utc,
+    to_utc,
 )
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
@@ -182,6 +190,42 @@ class Storage:
 
     def close(self) -> None:
         self._conn.close()
+
+    def init_db(self) -> None:
+        """Идемпотентная инициализация схемы и базовых справочников."""
+        self._apply_pragmas()
+        self._conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        self._conn.execute("PRAGMA foreign_keys = ON;")
+        self.seed_metadata()
+
+    def log_event(self, event: OrchestratorEvent) -> int:
+        """Совместимый метод записи OrchestratorEvent в таблицу orchestrator_events."""
+        return self.create_event(
+            message=event.message,
+            level=event.level,
+            event_code=event.event_code,
+            run_id=event.run_id,
+            task_id=event.task_id,
+            user_id=event.user_id,
+            timestamp=to_utc(event.timestamp),
+        )
+
+    def get_history(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Возвращает последние записи истории задач из SQLite."""
+        return self.list_tasks(order_by="task_id DESC", limit=limit)
+
+    def clear_runtime_data(self) -> None:
+        """Очищает операционные журналы и историю задач для полного сброса стенда."""
+        with self.transaction():
+            self._conn.execute("DELETE FROM lock_audit")
+            self._conn.execute("DELETE FROM orchestrator_events")
+            self._conn.execute("DELETE FROM task_runs")
+            self._conn.execute("DELETE FROM simulation_runs")
+            self._conn.execute("DELETE FROM dom_sla_staging_buffer")
+            self._conn.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN "
+                "('lock_audit', 'orchestrator_events', 'task_runs', 'simulation_runs', 'dom_sla_staging_buffer')"
+            )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

@@ -1,5 +1,5 @@
-import zipfile
 import xml.etree.ElementTree as ET
+import zipfile
 
 docx_path = r"C:\Users\marko\Desktop\Orchestrator case\Аудит ТЗ и Стека Оркестратора.docx"
 out_path = r"C:\Users\marko\Desktop\Orchestrator case\risk-orchestrator\doc_text.txt"
